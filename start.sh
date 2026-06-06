@@ -15,7 +15,6 @@ DOCKER_COMMON=(
   -e MAX_JOBS=16
   -e TRANSFORMERS_OFFLINE=1
   -e HF_OFFLINE=1
-  -e CUDA_VISIBLE_DEVICES="$DEVICES"
 
   -e NCCL_P2P_LEVEL=SYS
   -e NCCL_PROTO=LL,LL128,Simple
@@ -111,10 +110,10 @@ voipmonitor2() {
     --moe-backend b12x
     --linear-backend b12x
 
+    --max-model-len 262144
     --block-size 256
     # --load-format instanttensor fails with `ModuleNotFoundError: No module named 'instanttensor'`
     --load-format auto
-    --max-model-len 262144
     --max-num-seqs 16
     --max-num-batched-tokens 2048
     --max-cudagraph-capture-size 192
@@ -174,9 +173,9 @@ lavd1() {
     --moe-backend b12x
     --linear-backend b12x
 
+    --max-model-len 262144
     --block-size 256
     --load-format instanttensor
-    --max-model-len 262144
     --max-num-seqs 16
     --max-num-batched-tokens 2048
     --max-cudagraph-capture-size 192
@@ -207,8 +206,8 @@ cstechdev1() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.9
+    --max-model-len 262144
     --block-size 256
-    --max-model-len 1048576
     --max-num-seqs 8
     --disable-custom-all-reduce
     --reasoning-config.reasoning_start_str ' thinking'
