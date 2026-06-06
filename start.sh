@@ -194,5 +194,33 @@ lavd1() {
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
-docker rm -f voipmonitor1 voipmonitor2 lavd1 || true
+
+cstechdev1() {
+  NAME=cstechdev1
+  IMAGE='cstechdev/dsv4-flash@sha256:27b80536a36212cef21664699aee35acbc14b37f147d41cd9b12361154f3c4db'
+
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    "$IMAGE"
+    serve "${VLLM_COMMON[@]}"
+    --gpu-memory-utilization 0.9
+    --block-size 256
+    --max-model-len 1048576
+    --max-num-seqs 8
+    --disable-custom-all-reduce
+    --reasoning-config.reasoning_start_str ' thinking'
+    --reasoning-config.reasoning_end_str ' response'
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+    --enable-flashinfer-autotune
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+  )
+
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
+docker rm -f voipmonitor1 voipmonitor2 lavd1 cstechdev1 || true
 "$1"
