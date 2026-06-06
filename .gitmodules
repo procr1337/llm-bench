@@ -1,0 +1,3 @@
+[submodule "llm-inference-bench"]
+	path = llm-inference-bench
+	url = https://github.com/local-inference-lab/llm-inference-bench
