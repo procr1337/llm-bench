@@ -1,8 +1,11 @@
 #!/bin/bash
 set -euo pipefail
 
+TP=2
+DEVICES=0,1
+
 DOCKER_COMMON=(
-  --gpus '"device=0,1"'
+  --gpus '"device='"$DEVICES"'"'
   --ipc host
   --shm-size 8g
   --network llm --ip 172.23.0.10
@@ -12,7 +15,7 @@ DOCKER_COMMON=(
   -e MAX_JOBS=16
   -e TRANSFORMERS_OFFLINE=1
   -e HF_OFFLINE=1
-  -e CUDA_VISIBLE_DEVICES=0,1
+  -e CUDA_VISIBLE_DEVICES="$DEVICES"
 
   -e NCCL_P2P_LEVEL=SYS
   -e NCCL_PROTO=LL,LL128,Simple
@@ -26,7 +29,7 @@ VLLM_COMMON=(
   --host 0.0.0.0
   --port 8000
   --kv-cache-dtype fp8
-  --tensor-parallel-size 2
+  --tensor-parallel-size "$TP"
   --enable-prefix-caching
   --tokenizer-mode deepseek_v4
   --tool-call-parser deepseek_v4
@@ -68,7 +71,7 @@ voipmonitor1() {
 
 voipmonitor2() {
   NAME=voipmonitor2
-  IMAGE=voipmonitor/vllm:abyssal-abjuration-611a842
+  IMAGE=voipmonitor/vllm:abyssal-abjuration-611a842-a16-dcp@sha256:8601786e427faa72368e3d57e04d30a80a33bfbf5372352bdfb4358667827f36
 
   OPTS=(
     "${DOCKER_COMMON[@]}"
