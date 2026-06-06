@@ -1,8 +1,20 @@
 #!/bin/bash
 set -euo pipefail
 
-TP=2
-DEVICES=0,1
+TP="${TP:-2}"
+if [[ "$TP" == "4" ]]; then
+  DEVICES=0,1,2,3
+  MAX_MODEL_LEN=1048576
+elif [[ "$TP" == "2" ]]; then
+  DEVICES=0,1
+  MAX_MODEL_LEN=262144
+else
+  echo "Unsupported TP: $TP"
+  exit 1
+fi
+
+echo "Using TP $TP"
+
 
 DOCKER_COMMON=(
   --gpus '"device='"$DEVICES"'"'
@@ -23,6 +35,7 @@ DOCKER_COMMON=(
 
 VLLM_COMMON=(
   deepseek-ai/DeepSeek-V4-Flash
+  --max-model-len "$MAX_MODEL_LEN"
   --served-model-name deepseek-v4-flash
   --trust-remote-code
   --host 0.0.0.0
@@ -51,7 +64,6 @@ voipmonitor1() {
     --gpu-memory-utilization 0.95
     --block-size 256
     --load-format auto
-    --max-model-len 393216
     --max-num-seqs 64
     --max-cudagraph-capture-size 192
     --async-scheduling
@@ -110,7 +122,6 @@ voipmonitor2() {
     --moe-backend b12x
     --linear-backend b12x
 
-    --max-model-len 262144
     --block-size 256
     # --load-format instanttensor fails with `ModuleNotFoundError: No module named 'instanttensor'`
     --load-format auto
@@ -173,7 +184,6 @@ lavd1() {
     --moe-backend b12x
     --linear-backend b12x
 
-    --max-model-len 262144
     --block-size 256
     --load-format instanttensor
     --max-num-seqs 16
@@ -206,7 +216,6 @@ cstechdev1() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.9
-    --max-model-len 262144
     --block-size 256
     --max-num-seqs 8
     --disable-custom-all-reduce
