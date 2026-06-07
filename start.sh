@@ -265,5 +265,45 @@ lucifer1() {
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
-docker stop voipmonitor1 voipmonitor2 lavd1 cstechdev1 lucifer1 || true
+lucifer1_cutlass() {
+  NAME=lucifer1_cutlass
+  IMAGE=local/vllm:lucifer
+
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    "$IMAGE"
+    serve "${VLLM_COMMON[@]}"
+    --gpu-memory-utilization 0.95
+    --block-size 256
+    --load-format auto
+    --max-num-seqs 64
+    --max-cudagraph-capture-size 192
+    --async-scheduling
+    --no-scheduler-reserve-full-isl
+    --max-num-batched-tokens 8192
+    --attention-backend SPARSE_MLA_SM120
+    --enable-chunked-prefill
+    --enable-flashinfer-autotune
+    --kernel-config.moe_backend flashinfer_cutlass
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+  )
+
+  docker rm -f "$NAME"
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
+
+docker stop \
+  voipmonitor1 \
+  voipmonitor2 \
+  lavd1 \
+  cstechdev1 \
+  lucifer1 \
+  lucifer1_cutlass \
+  || true
+
 "$1"
