@@ -90,7 +90,7 @@ Prefill tok/s                           Aggregate decode tok/s
 
 `sha256:8601786e427faa72368e3d57e04d30a80a33bfbf5372352bdfb4358667827f36`
 
-Full logs in [./results/lavd1/](./results/voipmonitor2/)
+Full logs in [./results/voipmonitor2/](./results/voipmonitor2/)
 
 ```
 Prefill tok/s                          Aggregate decode tok/s

@@ -47,6 +47,7 @@ VLLM_COMMON=(
   --tool-call-parser deepseek_v4
   --enable-auto-tool-choice
   --reasoning-parser deepseek_v4
+  --enable-prompt-tokens-details
   --default-chat-template-kwargs '{"thinking": true, "reasoning_effort": "high"}'
 )
 
