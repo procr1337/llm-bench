@@ -1,7 +1,7 @@
 # =============================================================================
-# Lucifer stack: vLLM (local-inference-lab/vllm dev/unholy-fusion)
-#                + FlashInfer (sparse MLA SM120)
-#                + DeepGEMM (MXFP4xMXFP8 MoE)
+# Lucifer stack: vLLM #43477
+#                + FlashInfer #3395 (sparse MLA SM120)
+#                + DeepGEMM #324 (MXFP4xMXFP8 MoE)
 #                on CUDA 13.2 / Ubuntu 24.04 / Python 3.12
 #
 # Cherry-picks / patches applied on top of vLLM base commit:
@@ -11,20 +11,20 @@
 # FlashInfer: PR #3395 pre-force-push tip (9ad3567d85e4)
 #   adds sparse_mla_sm120 JIT kernels + BatchSparseMLAPagedAttentionWrapper
 #
-# DeepGEMM: 1f2f161 snapshot
-#   adds SM120 MXFP4xMXFP8 block-scaled MMA headers / compiled .so
+# DeepGEMM: PR #324 snapshot (1f2f161)
+#   adds SM120 MXFP4xMXFP8 block-scaled MMA headers
 #
 # Build:
 #   docker build --build-arg CACHEBUST=$(date +%s) \
 #     -f bench/Dockerfile --target lucifer-vllm-cu132 \
-#     -t lucifer-vllm:cu132 .
+#     -t lucifer-vllm-cu132:latest .
 # =============================================================================
 
 ARG CUDA_VERSION=13.2.0
 ARG UBUNTU_VERSION=24.04
 ARG PYTHON_VERSION=3.12
 ARG TORCH_VERSION=2.11.0
-ARG MAX_JOBS=24
+ARG MAX_JOBS=22
 ARG NVCC_THREADS=1
 ARG TORCH_CUDA_ARCH_LIST="12.0a"
 ARG CMAKE_CUDA_ARCHITECTURES="120a"
@@ -106,24 +106,23 @@ WORKDIR /build
 RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /build/cutlass && \
     grep "CUTLASS_MAJOR\|CUTLASS_MINOR\|CUTLASS_PATCH" /build/cutlass/include/cutlass/version.h | head -3
 
-# -- Clone vLLM from local-inference-lab fork, branch dev/unholy-fusion ------
+# -- Clone vLLM; fetch force-pushed PR commit by SHA
 #    1967a5627bc3: "fix(sm120): pass scratch for small prefill chunks"
-RUN git clone --branch dev/unholy-fusion --single-branch \
-    https://github.com/local-inference-lab/vllm.git /build/vllm
+RUN git clone --no-checkout https://github.com/vllm-project/vllm.git /build/vllm
 WORKDIR /build/vllm
-RUN git checkout 1967a5627bc3
-RUN git config user.email "build@docker" && git config user.name "build" && \
-    git remote add upstream https://github.com/vllm-project/vllm.git
+RUN git fetch origin 1967a5627bc3710b680bbec24ecb99aaddedf22b && \
+    git checkout FETCH_HEAD
+RUN git config user.email "build@docker" && git config user.name "build"
 
 # Cherry-pick 1: upstream #42879 (merged as b372ad3e90) -- stream DSML tool-call arg deltas
-RUN git fetch upstream main && \
+RUN git fetch origin b372ad3e9018f032478619adbc7f7fdcc9318212 && \
     git cherry-pick --no-commit b372ad3e9018f032478619adbc7f7fdcc9318212
 
 # Cherry-pick 2: upstream #42784 backport (b90c4950db) -- Eagle/MTP SWA cache block mask fix
-RUN git fetch upstream pull/42784/head:pr-42784 && \
+RUN git fetch origin b90c4950db520998a97809e1268fc491badd88bc && \
     git cherry-pick --no-commit b90c4950db520998a97809e1268fc491badd88bc
 
-# -- Install vLLM Python deps (without torch) ---------------------------------
+# -- Install vLLM Python deps (without torch)
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     grep -v '^torch==' requirements/build/cuda.txt > /tmp/build-notorch.txt && \
@@ -132,35 +131,35 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install -r requirements/common.txt && \
     uv pip install setuptools_scm
 
-# -- PyTorch (cu130 index -- cu130 wheels cover all CUDA 13.x) ---------------
+# -- PyTorch (cu130 index -- cu130 wheels cover all CUDA 13.x)
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install torch==${TORCH_VERSION} torchvision==0.26.0 \
+    pip install torch==${TORCH_VERSION} torchvision==0.26.0 torchaudio==2.11.0 \
     --index-url https://download.pytorch.org/whl/cu130 \
     --force-reinstall
 RUN python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 
-# -- NCCL / cublas for CUDA 13 ------------------------------------------------
+# -- NCCL / cublas for CUDA 13
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --force-reinstall nvidia-nccl-cu13==2.28.9
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --force-reinstall nvidia-cublas==13.1.0.3
 
-# -- Triton -------------------------------------------------------------------
+# -- Triton
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install triton==3.6.0 --force-reinstall
 
-# -- CUTLASS 4.x DSL ----------------------------------------------------------
+# -- CUTLASS 4.x DSL
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/root/.cache/pip \
     uv pip install "nvidia-cutlass-dsl[cu13]==4.5.0" && \
     pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13==4.5.0
 
-# -- Transformers + tokenizers (versions locked to match cstechdev image) ----
-# transformers==5.9.0 requires tokenizers>=0.22.0,<=0.23.0; cstechdev image uses 0.22.2.
+# -- Transformers + tokenizers
+# transformers==5.9.0 requires tokenizers>=0.22.0,<=0.23.0
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install "transformers==5.9.0" "tokenizers==0.22.2"
 
-# -- Misc packages (cstechdev-matched versions where known) -------------------
+# -- Misc packages
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --no-deps \
     accelerate \
@@ -175,7 +174,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     "mooncake-transfer-engine==0.3.8.post1" \
     "cuda-bindings==13.3.0" \
     "cuda-core==1.0.1" \
-    "cuda-tile==1.3.0"
+    "cuda-tile==1.3.0" \
+    quack-kernels==0.4.1 \
+    humming-kernels==0.1.0 \
+    numba==0.65.0 \
+    llvmlite==0.47.0 \
+    flashinfer-cubin==0.6.11.post3 \
+    nvidia-cuda-cccl==13.3.3.3.1 \
+    nvidia-cuda-crt==13.3.33 \
+    nvidia-cuda-nvcc==13.2.78 \
+    nvidia-cuda-tileiras==13.2.78 \
+    nvidia-nvvm==13.2.78
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install xformers --index-url https://download.pytorch.org/whl/nightly/cu130 --no-deps || true
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -223,11 +232,12 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "tqdm==4.67.3"
 
 WORKDIR /build
-RUN git clone --filter=blob:none https://github.com/flashinfer-ai/flashinfer.git
+RUN git clone --filter=blob:none --no-checkout https://github.com/flashinfer-ai/flashinfer.git
 WORKDIR /build/flashinfer
 
-# PR #3395 pre-force-push commit: partial clone has all commit objects
-RUN git checkout 9ad3567d85e46abcda8ba5140a5e6125b18c91f0 && \
+# PR #3395 pre-force-push commit (dangling ref, fetchable by SHA)
+RUN git fetch origin 9ad3567d85e46abcda8ba5140a5e6125b18c91f0 && \
+    git checkout FETCH_HEAD && \
     git submodule update --init --recursive
 
 RUN --mount=type=cache,target=/root/.cache/pip \
@@ -251,6 +261,13 @@ WORKDIR /build/vllm
 # Don't let vLLM replace our carefully chosen torch
 RUN python use_existing_torch.py
 
+# -- CUTLASS MoE patch (voipmonitor overlay: DSv4 MXFP4 weight loading + optional alpha/beta)
+COPY patches/cutlass_moe.patch /tmp/cutlass_moe.patch
+RUN git apply /tmp/cutlass_moe.patch && rm /tmp/cutlass_moe.patch
+
+# Fetch triton_kernels from triton-lang/triton v3.7.0 (matches cstechdev image)
+RUN git clone --depth 1 --branch v3.7.0 https://github.com/triton-lang/triton.git /build/triton
+
 RUN mv /build/vllm /opt/vllm
 WORKDIR /opt/vllm
 
@@ -258,26 +275,23 @@ RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/root/.cache/pip \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_CUTLASS_SRC_DIR=/build/cutlass \
+    TRITON_KERNELS_SRC_DIR=/build/triton/python/triton_kernels/triton_kernels \
     MAX_JOBS=${MAX_JOBS} \
     NVCC_THREADS=${NVCC_THREADS} \
     pip install --no-build-isolation --no-deps -e . 2>&1
 
 RUN python -c "import vllm; print(f'vLLM {vllm.__version__}')"
 
-# TODO: move quack-kernels install to the deps stage once stable
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install quack-kernels==0.4.1 humming-kernels==0.1.0
-
-# -- Reinstall cutlass-dsl-libs LAST -----------------------------------------
+# -- Reinstall cutlass-dsl-libs LAST
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13==4.5.0
 
-# -- Patch cutlass-dsl blockscaled_layout from CUTLASS git main ---------------
+# -- Patch cutlass-dsl blockscaled_layout from CUTLASS git main
 RUN CUTLASS_DSL=$(python -c 'import cutlass.utils.blockscaled_layout as m; print(m.__file__)') && \
     cp /build/cutlass/python/CuTeDSL/cutlass/utils/blockscaled_layout.py "$CUTLASS_DSL" && \
     python -c 'from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa; print("OK: sm120_make_smem_layout_sfa")'
 
-# -- Remove any stray CUDA 12 pip packages ------------------------------------
+# -- Remove any stray CUDA 12 pip packages
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip uninstall -y \
     nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 \
@@ -379,10 +393,8 @@ ENV PYTHONNOUSERSITE=1 \
     HF_HUB_OFFLINE=1 \
     OMP_NUM_THREADS=8 \
     VLLM_WORKER_MULTIPROC_METHOD=spawn \
-    VLLM_ALLREDUCE_USE_SYMM_MEM=0
-
-# NCCL tuning (matched from cstechdev image)
-ENV NCCL_IB_DISABLE=1 \
+    VLLM_ALLREDUCE_USE_SYMM_MEM=0 \
+    NCCL_IB_DISABLE=1 \
     NCCL_SOCKET_IFNAME=lo \
     NCCL_PROTO=LL,LL128,Simple \
     NCCL_ALLOC_P2P_NET_LL_BUFFERS=1 \

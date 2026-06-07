@@ -91,11 +91,8 @@ It runs correctly against CUDA 13.2 at runtime; no `cu132` wheels exist.
 
 | Repo | Commit | Dirty |
 |---|---|---|
-| `local-inference-lab/vllm`, branch `dev/unholy-fusion` | `1967a5627bc3710b680bbec24ecb99aaddedf22b` | false |
-
-> `1967a5627bc3` originates from `vllm-project/vllm` (force-pushed PR tip);
-> fetchable by SHA: `git fetch upstream 1967a5627bc3`.
-| `deepseek-ai/flashinfer`, PR #3395 pre-force-push | `9ad3567d85e46abcda8ba5140a5e6125b18c91f0` | false |
+| `vllm-project/vllm` (force-pushed PR tip) | `1967a5627bc3710b680bbec24ecb99aaddedf22b` | false |
+| `deepseek-ai/flashinfer` (PR #3395 pre-force-push) | `9ad3567d85e46abcda8ba5140a5e6125b18c91f0` | false |
 | `deepseek-ai/DeepGEMM`, PR #324 mid-development | `1f2f161dba747b7c12671d017f7c88e1249c3d3e` | true |
 | build harness (private) | `e78700e9b1c1fad665613147cbd97882234a1e00` | true |
 
@@ -105,9 +102,9 @@ It runs correctly against CUDA 13.2 at runtime; no `cu132` wheels exist.
 
 ## vLLM — diffs vs upstream commit `1967a5627bc3`
 
-Commit `1967a5627bc3` ("fix(sm120): pass scratch for small prefill chunks") is the
-11th commit from the tip of `local-inference-lab/vllm` branch `dev/unholy-fusion`.
-It is **not** present on `vllm-project/vllm` main.
+Commit `1967a5627bc3` ("fix(sm120): pass scratch for small prefill chunks") is from
+a force-pushed upstream PR on `vllm-project/vllm`. It is not on `main` but remains
+fetchable by SHA.
 
 ### Patch 1 — PR #42784: SWA cache block mask (Eagle/MTP)
 
@@ -118,7 +115,7 @@ directory.
 `vllm/v1/core/single_type_kv_cache_manager.py`.
 
 **Upstream commit**: `b90c4950db520998a97809e1268fc491badd88bc` — not on upstream main
-at build time; fetched via `pull/42784/head`. The applied files add a
+at build time; fetchable by SHA. The applied files add a
 `# Backported from vllm-project/vllm#42784.` attribution comment.
 
 **Effect**: Disables the `SlidingWindowManager` block mask inside Eagle/MTP attention
@@ -330,12 +327,12 @@ Key conda-forge packages (from `micromamba list --prefix /opt/env`):
 
 ## Reproduction Notes
 
-- **vLLM repo**: `https://github.com/local-inference-lab/vllm.git`, branch `dev/unholy-fusion`, checkout `1967a5627bc3`
+- **vLLM repo**: `https://github.com/vllm-project/vllm.git`, fetch `1967a5627bc3` by SHA
 - **vLLM requirements**: `requirements/build/cuda.txt` (fork restructured build deps into per-device subdirs)
 - **PyTorch index**: `https://download.pytorch.org/whl/cu130` (`cu130` is the only CUDA-13.x flavor; works at runtime on CUDA 13.2)
-- **Cherry-pick #42879** (`b372ad3e9018f032478619adbc7f7fdcc9318212`): reachable via `git fetch upstream main` then cherry-pick by SHA
-- **Cherry-pick #42784** (`b90c4950db520998a97809e1268fc491badd88bc`): not on upstream main; fetch via `git fetch upstream pull/42784/head:pr-42784` then cherry-pick by SHA
-- **FlashInfer commit `9ad3567d`**: pre-force-push dangling ref; fetch via `pull/3395/head` on a `--filter=blob:none` partial clone, then checkout by SHA
-- **DeepGEMM commit `1f2f161`**: PR #324 mid-development snapshot; fetch via `pull/324/head`
+- **Cherry-pick #42879** (`b372ad3e9018f032478619adbc7f7fdcc9318212`): fetch by SHA, cherry-pick
+- **Cherry-pick #42784** (`b90c4950db520998a97809e1268fc491badd88bc`): fetch by SHA, cherry-pick
+- **FlashInfer commit `9ad3567d`**: dangling ref; fetch by SHA from `flashinfer-ai/flashinfer`
+- **DeepGEMM commit `1f2f161`**: fetch by SHA from `deepseek-ai/DeepGEMM`
 - **CUDA arch list**: set `TORCH_CUDA_ARCH_LIST=12.0;12.1` (overridable via `DSV4_VLLM_CUDA_ARCH_LIST`)
 - **Install method**: `pip --no-index --no-deps --require-hashes`; no compilation inside Docker
