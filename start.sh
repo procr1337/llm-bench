@@ -221,7 +221,7 @@ cstechdev1() {
 
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization 0.95
     --block-size 256
     --max-num-seqs 8
     --disable-custom-all-reduce
@@ -249,7 +249,7 @@ lucifer1() {
 
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
-    --gpu-memory-utilization 0.9
+    --gpu-memory-utilization 0.95
     --block-size 256
     --max-num-seqs 8
     --disable-custom-all-reduce
