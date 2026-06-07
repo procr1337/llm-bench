@@ -49,6 +49,7 @@ VLLM_COMMON=(
   --reasoning-parser deepseek_v4
   --enable-prompt-tokens-details
   --default-chat-template-kwargs '{"thinking": true, "reasoning_effort": "high"}'
+  #--kv-offloading-size 40
 )
 
 voipmonitor1() {
@@ -78,6 +79,7 @@ voipmonitor1() {
     --speculative-config.num_speculative_tokens 2
   )
 
+  docker rm -f "$NAME"
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
@@ -132,6 +134,7 @@ voipmonitor2() {
     --async-scheduling
     --no-scheduler-reserve-full-isl
     --enable-chunked-prefill
+    #--decode-context-parallel-size 2
 
     # This is probably pointless: `Skipping FlashInfer autotune because no FlashInfer compute kernels are active.`
     --enable-flashinfer-autotune
@@ -140,6 +143,7 @@ voipmonitor2() {
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"greedy","moe_backend":"b12x"}'
   )
 
+  docker rm -f "$NAME"
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
@@ -201,6 +205,7 @@ lavd1() {
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"greedy","moe_backend":"b12x"}'
   )
 
+  docker rm -f "$NAME"
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
@@ -228,8 +233,37 @@ cstechdev1() {
     --speculative-config.num_speculative_tokens 2
   )
 
+  docker rm -f "$NAME"
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
-docker rm -f voipmonitor1 voipmonitor2 lavd1 cstechdev1 || true
+lucifer1() {
+  NAME=lucifer1
+  # "Reverse engineered" from cstechdev/dsv4-flash - see lucifer-image-analysis/cstechdev.md
+  IMAGE=local/vllm:lucifer
+
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    "$IMAGE"
+    serve "${VLLM_COMMON[@]}"
+    --gpu-memory-utilization 0.9
+    --block-size 256
+    --max-num-seqs 8
+    --disable-custom-all-reduce
+    --reasoning-config.reasoning_start_str ' thinking'
+    --reasoning-config.reasoning_end_str ' response'
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+    --enable-flashinfer-autotune
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+  )
+
+  docker rm -f "$NAME"
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
+docker stop voipmonitor1 voipmonitor2 lavd1 cstechdev1 lucifer1 || true
 "$1"

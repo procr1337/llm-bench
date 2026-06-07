@@ -1,0 +1,418 @@
+# =============================================================================
+# Lucifer stack: vLLM (local-inference-lab/vllm dev/unholy-fusion)
+#                + FlashInfer (sparse MLA SM120)
+#                + DeepGEMM (MXFP4xMXFP8 MoE)
+#                on CUDA 13.2 / Ubuntu 24.04 / Python 3.12
+#
+# Cherry-picks / patches applied on top of vLLM base commit:
+#   - upstream #42879 (b372ad3e90) : stream DeepSeek DSML tool-call arg deltas
+#   - upstream #42784 (b90c4950db) : Eagle/MTP SWA cache block mask fix
+#
+# FlashInfer: PR #3395 pre-force-push tip (9ad3567d85e4)
+#   adds sparse_mla_sm120 JIT kernels + BatchSparseMLAPagedAttentionWrapper
+#
+# DeepGEMM: 1f2f161 snapshot
+#   adds SM120 MXFP4xMXFP8 block-scaled MMA headers / compiled .so
+#
+# Build:
+#   docker build --build-arg CACHEBUST=$(date +%s) \
+#     -f bench/Dockerfile --target lucifer-vllm-cu132 \
+#     -t lucifer-vllm:cu132 .
+# =============================================================================
+
+ARG CUDA_VERSION=13.2.0
+ARG UBUNTU_VERSION=24.04
+ARG PYTHON_VERSION=3.12
+ARG TORCH_VERSION=2.11.0
+ARG MAX_JOBS=24
+ARG NVCC_THREADS=1
+ARG TORCH_CUDA_ARCH_LIST="12.0a"
+ARG CMAKE_CUDA_ARCHITECTURES="120a"
+
+# =============================================================================
+# Stage 1: base -- Ubuntu 24.04 + CUDA 13.2 + system packages
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS lucifer-base
+
+ARG PYTHON_VERSION
+ARG DEBIAN_FRONTEND=noninteractive
+
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-dev \
+    python${PYTHON_VERSION}-venv \
+    python3-pip \
+    git \
+    git-lfs \
+    wget \
+    curl \
+    build-essential \
+    cmake \
+    ninja-build \
+    ccache \
+    pkg-config \
+    libssl-dev \
+    libffi-dev \
+    libgomp1 \
+    numactl \
+    libnuma-dev \
+    libibverbs-dev \
+    pciutils
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
+
+RUN uv venv /opt/venv --python python${PYTHON_VERSION}
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}"
+
+RUN uv pip install pip setuptools wheel
+
+ENV UV_CACHE_DIR=/root/.cache/uv
+
+ENV CCACHE_DIR=/root/.ccache \
+    CMAKE_C_COMPILER_LAUNCHER=ccache \
+    CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+    CMAKE_CUDA_COMPILER_LAUNCHER=ccache
+
+# =============================================================================
+# Stage 2: deps -- PyTorch (cu130 wheels) + Triton + base packages
+# =============================================================================
+FROM lucifer-base AS lucifer-deps
+
+ARG TORCH_VERSION
+ARG TORCH_CUDA_ARCH_LIST
+ARG MAX_JOBS
+ARG NVCC_THREADS
+ARG CACHEBUST=0
+
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS}
+
+WORKDIR /build
+
+# CUTLASS -- latest main for SM120a headers required by vLLM + FlashInfer
+RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /build/cutlass && \
+    grep "CUTLASS_MAJOR\|CUTLASS_MINOR\|CUTLASS_PATCH" /build/cutlass/include/cutlass/version.h | head -3
+
+# -- Clone vLLM from local-inference-lab fork, branch dev/unholy-fusion ------
+#    1967a5627bc3: "fix(sm120): pass scratch for small prefill chunks"
+RUN git clone --branch dev/unholy-fusion --single-branch \
+    https://github.com/local-inference-lab/vllm.git /build/vllm
+WORKDIR /build/vllm
+RUN git checkout 1967a5627bc3
+RUN git config user.email "build@docker" && git config user.name "build" && \
+    git remote add upstream https://github.com/vllm-project/vllm.git
+
+# Cherry-pick 1: upstream #42879 (merged as b372ad3e90) -- stream DSML tool-call arg deltas
+RUN git fetch upstream main && \
+    git cherry-pick --no-commit b372ad3e9018f032478619adbc7f7fdcc9318212
+
+# Cherry-pick 2: upstream #42784 backport (b90c4950db) -- Eagle/MTP SWA cache block mask fix
+RUN git fetch upstream pull/42784/head:pr-42784 && \
+    git cherry-pick --no-commit b90c4950db520998a97809e1268fc491badd88bc
+
+# -- Install vLLM Python deps (without torch) ---------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    grep -v '^torch==' requirements/build/cuda.txt > /tmp/build-notorch.txt && \
+    uv pip install -r /tmp/build-notorch.txt && \
+    rm /tmp/build-notorch.txt && \
+    uv pip install -r requirements/common.txt && \
+    uv pip install setuptools_scm
+
+# -- PyTorch (cu130 index -- cu130 wheels cover all CUDA 13.x) ---------------
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install torch==${TORCH_VERSION} torchvision==0.26.0 \
+    --index-url https://download.pytorch.org/whl/cu130 \
+    --force-reinstall
+RUN python -c "import torch; print(f'PyTorch: {torch.__version__}')"
+
+# -- NCCL / cublas for CUDA 13 ------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --force-reinstall nvidia-nccl-cu13==2.28.9
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --force-reinstall nvidia-cublas==13.1.0.3
+
+# -- Triton -------------------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install triton==3.6.0 --force-reinstall
+
+# -- CUTLASS 4.x DSL ----------------------------------------------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cache/pip \
+    uv pip install "nvidia-cutlass-dsl[cu13]==4.5.0" && \
+    pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13==4.5.0
+
+# -- Transformers + tokenizers (versions locked to match cstechdev image) ----
+# transformers==5.9.0 requires tokenizers>=0.22.0,<=0.23.0; cstechdev image uses 0.22.2.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install "transformers==5.9.0" "tokenizers==0.22.2"
+
+# -- Misc packages (cstechdev-matched versions where known) -------------------
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --no-deps \
+    accelerate \
+    safetensors==0.7.0 \
+    sentencepiece==0.2.1 \
+    bitsandbytes
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install \
+    tilelang==0.1.9 \
+    tokenspeed-mla==0.1.2 \
+    "tokenspeed-triton==3.7.10.post20260505" \
+    "mooncake-transfer-engine==0.3.8.post1" \
+    "cuda-bindings==13.3.0" \
+    "cuda-core==1.0.1" \
+    "cuda-tile==1.3.0"
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install xformers --index-url https://download.pytorch.org/whl/nightly/cu130 --no-deps || true
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install fastsafetensors==0.3.2 || true
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade cmake
+
+# Confirm torch still correct after all installs
+RUN python -c "import torch; v=torch.__version__; print(f'PyTorch {v}'); assert 'cu13' in v, f'WRONG TORCH: {v}'"
+
+# =============================================================================
+# Stage 3: DeepGEMM at 1f2f161 (MXFP4xMXFP8 SM120 MoE)
+# =============================================================================
+FROM lucifer-deps AS lucifer-deepgemm
+
+WORKDIR /build
+RUN --mount=type=cache,target=/root/.cache/pip \
+    git clone https://github.com/deepseek-ai/DeepGEMM.git && \
+    cd DeepGEMM && \
+    git fetch origin pull/324/head:pr-324 && \
+    git checkout 1f2f161 && \
+    git submodule update --init --recursive && \
+    pip install --no-build-isolation --no-deps .
+
+RUN python -c "import deep_gemm; print('DeepGEMM OK')" || \
+    python -c "import importlib, sys; m=importlib.util.find_spec('deep_gemm'); print('DeepGEMM spec:', m)"
+
+# =============================================================================
+# Stage 4: FlashInfer at 9ad3567d (PR #3395 sparse MLA SM120)
+# =============================================================================
+FROM lucifer-deepgemm AS lucifer-flashinfer
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --upgrade setuptools pip && \
+    uv pip install \
+        "apache-tvm-ffi==0.1.9" \
+        "nvidia-cudnn-frontend==1.18.0" \
+        packaging \
+        "nvidia-ml-py==13.595.45" \
+        "requests==2.34.2" \
+        "numpy==2.4.6" \
+        "einops==0.8.2" \
+        "click==8.4.1" \
+        "tabulate==0.10.0" \
+        "tqdm==4.67.3"
+
+WORKDIR /build
+RUN git clone --filter=blob:none https://github.com/flashinfer-ai/flashinfer.git
+WORKDIR /build/flashinfer
+
+# PR #3395 pre-force-push commit: partial clone has all commit objects
+RUN git checkout 9ad3567d85e46abcda8ba5140a5e6125b18c91f0 && \
+    git submodule update --init --recursive
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    echo "=== FlashInfer 9ad3567d: sparse MLA SM120 (PR #3395 pre-force-push) ===" && \
+    FLASHINFER_CUDA_ARCH_LIST="12.0a" \
+    FLASHINFER_ENABLE_SM90=0 \
+    MAX_JOBS=${MAX_JOBS} \
+    pip install --no-build-isolation --no-deps .
+
+ENV FLASHINFER_DISABLE_VERSION_CHECK=1
+RUN python -c "import flashinfer; print(f'FlashInfer: {getattr(flashinfer, \"__version__\", \"source-install\")}')"
+RUN python -c "from flashinfer import BatchSparseMLAPagedAttentionWrapper; print('BatchSparseMLAPagedAttentionWrapper OK')"
+
+# =============================================================================
+# Stage 5: Build vLLM from source
+# =============================================================================
+FROM lucifer-flashinfer AS lucifer-vllm-build
+
+WORKDIR /build/vllm
+
+# Don't let vLLM replace our carefully chosen torch
+RUN python use_existing_torch.py
+
+RUN mv /build/vllm /opt/vllm
+WORKDIR /opt/vllm
+
+RUN --mount=type=cache,target=/root/.ccache \
+    --mount=type=cache,target=/root/.cache/pip \
+    VLLM_TARGET_DEVICE=cuda \
+    VLLM_CUTLASS_SRC_DIR=/build/cutlass \
+    MAX_JOBS=${MAX_JOBS} \
+    NVCC_THREADS=${NVCC_THREADS} \
+    pip install --no-build-isolation --no-deps -e . 2>&1
+
+RUN python -c "import vllm; print(f'vLLM {vllm.__version__}')"
+
+# TODO: move quack-kernels install to the deps stage once stable
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install quack-kernels==0.4.1 humming-kernels==0.1.0
+
+# -- Reinstall cutlass-dsl-libs LAST -----------------------------------------
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --force-reinstall --no-deps nvidia-cutlass-dsl-libs-cu13==4.5.0
+
+# -- Patch cutlass-dsl blockscaled_layout from CUTLASS git main ---------------
+RUN CUTLASS_DSL=$(python -c 'import cutlass.utils.blockscaled_layout as m; print(m.__file__)') && \
+    cp /build/cutlass/python/CuTeDSL/cutlass/utils/blockscaled_layout.py "$CUTLASS_DSL" && \
+    python -c 'from cutlass.utils.blockscaled_layout import sm120_make_smem_layout_sfa; print("OK: sm120_make_smem_layout_sfa")'
+
+# -- Remove any stray CUDA 12 pip packages ------------------------------------
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip uninstall -y \
+    nvidia-cublas-cu12 nvidia-cuda-cupti-cu12 nvidia-cuda-nvrtc-cu12 \
+    nvidia-cuda-runtime-cu12 nvidia-cudnn-cu12 nvidia-cufft-cu12 \
+    nvidia-cufile-cu12 nvidia-curand-cu12 nvidia-cusolver-cu12 \
+    nvidia-cusparse-cu12 nvidia-cusparselt-cu12 nvidia-nccl-cu12 \
+    nvidia-nvjitlink-cu12 nvidia-nvshmem-cu12 nvidia-nvtx-cu12 \
+    2>/dev/null || true && \
+    pip install --force-reinstall \
+        nvidia-nccl-cu13==2.28.9 \
+        nvidia-cusparselt-cu13==0.8.0 \
+        nvidia-nvshmem-cu13==3.4.5 \
+        nvidia-cudnn-cu13==9.19.0.56 \
+    2>/dev/null || true && \
+    pip install --force-reinstall nvidia-cublas==13.1.0.3 && \
+    python -c "import torch; print(f'torch {torch.__version__} OK')"
+
+# Clean up build artefacts but not pip/uv caches (those are mounted)
+RUN find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
+    find /opt/venv -name "*.pyc" -delete 2>/dev/null || true && \
+    find /opt/venv -name "*.a" -delete 2>/dev/null || true
+
+# =============================================================================
+# Stage 6: lucifer-vllm-cu132 -- runtime image
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS lucifer-vllm-cu132
+
+ARG PYTHON_VERSION=3.12
+ARG UBUNTU_VERSION=24.04
+ARG TORCH_CUDA_ARCH_LIST
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+    python${PYTHON_VERSION} \
+    python${PYTHON_VERSION}-venv \
+    python${PYTHON_VERSION}-dev \
+    gcc \
+    g++ \
+    libc6-dev \
+    libgomp1 \
+    numactl \
+    libnuma1 \
+    libibverbs1 \
+    ninja-build \
+    pciutils \
+    curl \
+    git
+
+RUN update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --install /usr/bin/python python /usr/bin/python${PYTHON_VERSION} 1
+
+COPY --from=lucifer-vllm-build /opt/vllm /opt/vllm
+COPY --from=lucifer-vllm-build /opt/venv /opt/venv
+
+ENV VIRTUAL_ENV=/opt/venv \
+    PATH="/opt/venv/bin:${PATH}" \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
+    FLASHINFER_DISABLE_VERSION_CHECK=1 \
+    NCCL_P2P_DISABLE=0 \
+    NCCL_IB_DISABLE=0 \
+    CUDA_DEVICE_MAX_CONNECTIONS=32
+
+# JIT cache directories (SM120 kernels JIT-compiled on first run)
+ENV TRITON_CACHE_DIR=/cache/jit/triton \
+    TORCH_EXTENSIONS_DIR=/cache/jit/torch_extensions \
+    VLLM_CACHE_DIR=/cache/jit/vllm \
+    FLASHINFER_WORKSPACE_BASE=/cache/jit/flashinfer \
+    TVM_FFI_CACHE_DIR=/cache/jit/tvm-ffi \
+    XDG_CACHE_HOME=/cache/jit \
+    HF_HOME=/root/.cache/huggingface
+
+RUN mkdir -p /cache/jit/triton /cache/jit/torch_extensions /cache/jit/vllm
+
+ENV LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/nvidia/cu13/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH}"
+
+WORKDIR /workspace
+
+# Smoke test (runs at build time; SM120 JIT kernels skipped since no GPU)
+RUN python -c "\
+import torch, vllm, flashinfer, transformers; \
+print(f'PyTorch:      {torch.__version__}'); \
+print(f'CUDA:         {torch.version.cuda}'); \
+print(f'vLLM:         {vllm.__version__}'); \
+print(f'FlashInfer:   {getattr(flashinfer, \"__version__\", \"source-install\")}'); \
+print(f'Transformers: {transformers.__version__}'); \
+assert 'cu13' in torch.__version__, f'WRONG TORCH: {torch.__version__}'; \
+print('OK: smoke test passed') \
+"
+
+# Runtime env vars (matched from cstechdev image)
+ENV PYTHONNOUSERSITE=1 \
+    HF_HUB_OFFLINE=1 \
+    OMP_NUM_THREADS=8 \
+    VLLM_WORKER_MULTIPROC_METHOD=spawn \
+    VLLM_ALLREDUCE_USE_SYMM_MEM=0
+
+# NCCL tuning (matched from cstechdev image)
+ENV NCCL_IB_DISABLE=1 \
+    NCCL_SOCKET_IFNAME=lo \
+    NCCL_PROTO=LL,LL128,Simple \
+    NCCL_ALLOC_P2P_NET_LL_BUFFERS=1 \
+    NCCL_P2P_LEVEL=SYS \
+    NCCL_NET_GDR_LEVEL=SYS \
+    NCCL_MIN_NCHANNELS=8
+
+# Entrypoint script (matched from cstechdev dsv4-vllm-entrypoint)
+COPY <<'EOF' /usr/local/bin/dsv4-vllm-entrypoint
+#!/usr/bin/env bash
+set -euo pipefail
+
+export PYTHONNOUSERSITE="${PYTHONNOUSERSITE:-1}"
+export FLASHINFER_DISABLE_VERSION_CHECK="${FLASHINFER_DISABLE_VERSION_CHECK:-1}"
+export FLASHINFER_WORKSPACE_BASE="${FLASHINFER_WORKSPACE_BASE:-/cache/flashinfer}"
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-/cache/vllm}"
+export DG_JIT_CACHE_DIR="${DG_JIT_CACHE_DIR:-/cache/deep_gemm_jit}"
+export TILELANG_CACHE_DIR="${TILELANG_CACHE_DIR:-/cache/tilelang}"
+export TILELANG_TMP_DIR="${TILELANG_TMP_DIR:-${TILELANG_CACHE_DIR}/tmp}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-/cache/triton}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/cache/torchinductor}"
+export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-/cache/torch_extensions}"
+
+if [[ "${DSV4_VLLM_CREATE_CACHE_DIRS:-1}" != "0" ]]; then
+  mkdir -p "${FLASHINFER_WORKSPACE_BASE}" "${VLLM_CACHE_ROOT}" "${DG_JIT_CACHE_DIR}" "${TILELANG_CACHE_DIR}" "${TILELANG_TMP_DIR}" \
+    "${TRITON_CACHE_DIR}" "${TORCHINDUCTOR_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
+fi
+
+exec vllm "$@"
+EOF
+RUN chmod +x /usr/local/bin/dsv4-vllm-entrypoint
+
+ENTRYPOINT ["/usr/local/bin/dsv4-vllm-entrypoint"]

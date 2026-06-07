@@ -10,10 +10,10 @@ target "llm-inference-bench" {
   output     = ["type=docker"]
 }
 
-target "voipmonitor2-wsfix" {
+target "vllm-lucifer" {
   context    = "."
-  dockerfile = "Dockerfile"
-  target     = "voipmonitor2-wsfix"
-  tags       = ["voipmonitor/vllm:abyssal-abjuration-611a842-a16-dcp-wsfix"]
+  dockerfile = "Dockerfile.lucifer"
+  target     = "lucifer-vllm-cu132"
+  tags       = ["local/vllm:lucifer"]
   output     = ["type=docker"]
 }
