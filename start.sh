@@ -137,7 +137,6 @@ voipmonitor2() {
     --async-scheduling
     --no-scheduler-reserve-full-isl
     --enable-chunked-prefill
-    --decode-context-parallel-size 2
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"greedy","moe_backend":"b12x"}'
   )
 
