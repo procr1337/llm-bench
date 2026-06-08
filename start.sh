@@ -53,7 +53,11 @@ VLLM_COMMON=(
   --reasoning-parser deepseek_v4
   --enable-prompt-tokens-details
   --default-chat-template-kwargs '{"thinking": true, "reasoning_effort": "high"}'
-  #--kv-offloading-size 40
+  --reasoning-config.reasoning_start_str '<think>'
+  --reasoning-config.reasoning_end_str '</think>'
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+  --enable-flashinfer-autotune
+  --block-size 256
 )
 
 voipmonitor1() {
@@ -68,16 +72,13 @@ voipmonitor1() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
-    --load-format auto
     --max-num-seqs 64
     --max-cudagraph-capture-size 192
     --async-scheduling
     --no-scheduler-reserve-full-isl
     --max-num-batched-tokens 8192
-    --attention-backend SPARSE_MLA_SM120
     --enable-chunked-prefill
-    --enable-flashinfer-autotune
+    --attention-backend SPARSE_MLA_SM120
     --kernel-config.moe_backend flashinfer_cutlass
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
@@ -129,21 +130,13 @@ voipmonitor2() {
     --moe-backend b12x
     --linear-backend b12x
 
-    --block-size 256
-    # --load-format instanttensor fails with `ModuleNotFoundError: No module named 'instanttensor'`
-    --load-format auto
     --max-num-seqs 16
     --max-num-batched-tokens 2048
     --max-cudagraph-capture-size 192
     --async-scheduling
     --no-scheduler-reserve-full-isl
     --enable-chunked-prefill
-    #--decode-context-parallel-size 2
-
-    # This is probably pointless: `Skipping FlashInfer autotune because no FlashInfer compute kernels are active.`
-    --enable-flashinfer-autotune
-
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+    --decode-context-parallel-size 2
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"greedy","moe_backend":"b12x"}'
   )
 
@@ -193,7 +186,6 @@ lavd1() {
     --moe-backend b12x
     --linear-backend b12x
 
-    --block-size 256
     --load-format instanttensor
     --max-num-seqs 16
     --max-num-batched-tokens 2048
@@ -201,11 +193,6 @@ lavd1() {
     --async-scheduling
     --no-scheduler-reserve-full-isl
     --enable-chunked-prefill
-
-    # This is probably pointless: `Skipping FlashInfer autotune because no FlashInfer compute kernels are active.`
-    --enable-flashinfer-autotune
-
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
     --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"greedy","moe_backend":"b12x"}'
   )
 
@@ -226,13 +213,8 @@ cstechdev1() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
     --max-num-seqs 8
     --disable-custom-all-reduce
-    --reasoning-config.reasoning_start_str ' thinking'
-    --reasoning-config.reasoning_end_str ' response'
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
-    --enable-flashinfer-autotune
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
   )
@@ -255,13 +237,8 @@ lucifer1() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
     --max-num-seqs 8
     --disable-custom-all-reduce
-    --reasoning-config.reasoning_start_str ' thinking'
-    --reasoning-config.reasoning_end_str ' response'
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
-    --enable-flashinfer-autotune
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
   )
@@ -282,8 +259,6 @@ lucifer1_cutlass() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
-    --load-format auto
     --max-num-seqs 64
     --max-cudagraph-capture-size 192
     --async-scheduling
@@ -291,7 +266,6 @@ lucifer1_cutlass() {
     --max-num-batched-tokens 8192
     --attention-backend SPARSE_MLA_SM120
     --enable-chunked-prefill
-    --enable-flashinfer-autotune
     --kernel-config.moe_backend flashinfer_cutlass
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
@@ -313,14 +287,9 @@ lucifer2() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
     --load-format instanttensor
     --max-num-seqs 8
     --disable-custom-all-reduce
-    --reasoning-config.reasoning_start_str ' thinking'
-    --reasoning-config.reasoning_end_str ' response'
-    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
-    --enable-flashinfer-autotune
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
   )
@@ -341,7 +310,6 @@ lucifer2_cutlass() {
     "$IMAGE"
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
-    --block-size 256
     --load-format instanttensor
     --max-num-seqs 64
     --max-cudagraph-capture-size 192
@@ -349,7 +317,6 @@ lucifer2_cutlass() {
     --no-scheduler-reserve-full-isl
     --max-num-batched-tokens 8192
     --enable-chunked-prefill
-    --enable-flashinfer-autotune
     --kernel-config.moe_backend flashinfer_cutlass
     --speculative-config.method mtp
     --speculative-config.num_speculative_tokens 2
