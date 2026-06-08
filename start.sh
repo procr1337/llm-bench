@@ -31,6 +31,10 @@ DOCKER_COMMON=(
   -e NCCL_P2P_LEVEL=SYS
   -e NCCL_PROTO=LL,LL128,Simple
   -e NCCL_IB_DISABLE=1
+
+  # necessary to utilize KV cache effectively:
+  # https://github.com/vllm-project/vllm/pull/43447
+  -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
 )
 
 VLLM_COMMON=(
@@ -240,7 +244,8 @@ cstechdev1() {
 lucifer1() {
   NAME=lucifer1
   # "Reverse engineered" from cstechdev/dsv4-flash - see lucifer-image-analysis/cstechdev.md
-  IMAGE=local/vllm:lucifer
+  # built from llm-bench@91d75108209e295fdce5f495f46aca62ddcc1a69
+  IMAGE=local/vllm:lucifer-91d7510
 
   OPTS=(
     "${DOCKER_COMMON[@]}"
@@ -267,7 +272,7 @@ lucifer1() {
 
 lucifer1_cutlass() {
   NAME=lucifer1_cutlass
-  IMAGE=local/vllm:lucifer
+  IMAGE=local/vllm:lucifer-91d7510
 
   OPTS=(
     "${DOCKER_COMMON[@]}"
@@ -296,14 +301,42 @@ lucifer1_cutlass() {
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
+lucifer2() {
+  NAME=lucifer2
+  IMAGE=local/vllm:lucifer-798633d
 
-docker stop \
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    "$IMAGE"
+    serve "${VLLM_COMMON[@]}"
+    --gpu-memory-utilization 0.95
+    --block-size 256
+    --max-num-seqs 8
+    --disable-custom-all-reduce
+    --reasoning-config.reasoning_start_str ' thinking'
+    --reasoning-config.reasoning_end_str ' response'
+    --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'
+    --enable-flashinfer-autotune
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+  )
+
+  docker rm -f "$NAME"
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
+
+docker stop -t1 \
   voipmonitor1 \
   voipmonitor2 \
   lavd1 \
   cstechdev1 \
   lucifer1 \
   lucifer1_cutlass \
+  lucifer2 \
   || true
 
 "$1"
