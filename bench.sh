@@ -14,6 +14,7 @@ else
   exit 1
 fi
 
+echo "Running benchmark"
 OPTS=(
   --network llm
   -v "$(pwd)/results/$name:/out"
@@ -27,6 +28,22 @@ OPTS=(
 )
 docker run -ti --rm "${OPTS[@]}"
 
+# echo "Running prefix caching test"
+# OPTS=(
+#   --network llm
+#   -v "$(pwd)/results/$name:/out"
+#   local/llm-inference-bench
+#   --host 172.23.0.10
+#   --port 8000
+#   --no-hw-monitor
+#   --concurrency "$CONCURRENCY"
+#   --contexts 131072
+#   --distinct-prefixes
+#   --output /out/benchmark_results_distinct_prefixes.json
+# )
+# docker run -ti --rm "${OPTS[@]}"
+
+echo "Running estonia test"
 OPTS=(
   --network llm
   -v "$(pwd)/results/$name:/out"
@@ -34,9 +51,7 @@ OPTS=(
   --host 172.23.0.10
   --port 8000
   --no-hw-monitor
-  --concurrency "$CONCURRENCY"
-  --contexts 131072
-  --distinct-prefixes
-  --output /out/benchmark_results_distinct_prefixes.json
+  --test-profile estonia --profile-runs 50
+  --output /out/benchmark_results_estonia.json
 )
 docker run -ti --rm "${OPTS[@]}"
