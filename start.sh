@@ -314,6 +314,7 @@ lucifer2() {
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
     --block-size 256
+    --load-format instanttensor
     --max-num-seqs 8
     --disable-custom-all-reduce
     --reasoning-config.reasoning_start_str ' thinking'
@@ -341,7 +342,7 @@ lucifer2_cutlass() {
     serve "${VLLM_COMMON[@]}"
     --gpu-memory-utilization 0.95
     --block-size 256
-    --load-format auto
+    --load-format instanttensor
     --max-num-seqs 64
     --max-cudagraph-capture-size 192
     --async-scheduling
