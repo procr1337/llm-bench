@@ -366,6 +366,7 @@ docker stop -t1 \
   lucifer1 \
   lucifer1_cutlass \
   lucifer2 \
+  lucifer2_cutlass \
   || true
 
 "$1"

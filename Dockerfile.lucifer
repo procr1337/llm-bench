@@ -264,9 +264,6 @@ WORKDIR /build/vllm
 # Don't let vLLM replace our carefully chosen torch
 RUN python use_existing_torch.py
 
-# Fetch triton_kernels from triton-lang/triton v3.7.0 (matches cstechdev image)
-RUN git clone --depth 1 --branch v3.7.0 https://github.com/triton-lang/triton.git /build/triton
-
 RUN mv /build/vllm /opt/vllm
 WORKDIR /opt/vllm
 
@@ -274,7 +271,6 @@ RUN --mount=type=cache,target=/root/.ccache \
     --mount=type=cache,target=/root/.cache/pip \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_CUTLASS_SRC_DIR=/build/cutlass \
-    TRITON_KERNELS_SRC_DIR=/build/triton/python/triton_kernels/triton_kernels \
     MAX_JOBS=${MAX_JOBS} \
     NVCC_THREADS=${NVCC_THREADS} \
     pip install --no-build-isolation --no-deps -e . 2>&1

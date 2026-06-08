@@ -202,31 +202,92 @@ added by the build harness or a post-install patch layer.
 
 ---
 
-## Additional files not at `1967a5627bc3`
+## Vendored `triton_kernels` — merged from multiple Triton tags
 
-Six `triton_kernels` files exist in the image's vLLM `site-packages` that are
-**not present** when building with the default `TRITON_KERNELS_TAG=v3.5.1` from
-`cmake/external_projects/triton_kernels.cmake`. Their timestamps match the base
-wheel install layer (T−10 days), confirming they were included at wheel build time.
+vLLM's CMake (`cmake/external_projects/triton_kernels.cmake`) vendors
+`triton_kernels` from `triton-lang/triton` into
+`vllm/third_party/triton_kernels/` at build time. The default tag is
+`TRITON_KERNELS_TAG=v3.5.1`, overridable via `TRITON_KERNELS_SRC_DIR`.
 
-vLLM's CMake fetches `triton_kernels` from `triton-lang/triton` (the Triton
-monorepo, **not** the `triton` pip package). These 6 files were introduced in
-Triton commit `c69c3a954` ("Reland refactor of tensor/layout/distributed") and
-first appear in tag `v3.7.0`. The build harness either overrode
-`DEFAULT_TRITON_KERNELS_TAG` or set `TRITON_KERNELS_SRC_DIR` to a local Triton
-checkout at `v3.7.0` or newer.
+The cstechdev image contains **46 `.py` files** in
+`vllm/third_party/triton_kernels/`. This is a superset of what any single
+public Triton tag provides — it includes files from both `v3.5.1` and `v3.7.0`,
+which are mutually exclusive in the public repo (v3.7.0 refactored the module
+layout, removing several v3.5.1 files and adding new ones).
 
-- `vllm/third_party/triton_kernels/distributed.py` (435 lines)
-- `vllm/third_party/triton_kernels/reduce.py` (290 lines)
-- `vllm/third_party/triton_kernels/roofline.py` (301 lines)
-- `vllm/third_party/triton_kernels/tensor_details/bitmatrix.py`
-- `vllm/third_party/triton_kernels/tensor_details/bitmatrix_details/sum_bitmatrix_rows.py`
-- `vllm/third_party/triton_kernels/tensor_details/ragged_tensor.py`
+### Files present in `v3.5.1` but removed in `v3.7.0`
 
-These are distributed MoE triton kernels (`ExptAssignment`, symmetric memory
-all-reduce, bitmatrix routing). Their absence from our lucifer build has no
-known runtime impact for DSv4 inference — vLLM does not import them on the
-standard TP=2 code path.
+These files are in the image and are required by vLLM's `mxfp4.py` and
+`config.py` for the Triton MoE backend (`Mxfp4MoeBackend.TRITON` /
+`AITER_MXFP4_FP8`). They provide the `matmul_ogs` kernel (fused MoE
+matmul with output-grouped scattering):
+
+- `matmul_ogs.py`
+- `matmul_ogs_details/_common.py`
+- `matmul_ogs_details/_matmul_ogs.py`
+- `matmul_ogs_details/_p_matmul_ogs.py`
+- `matmul_ogs_details/_reduce_grouped.py`
+- `matmul_ogs_details/opt_flags.py`
+- `matmul_ogs_details/opt_flags_details/opt_flags_amd.py`
+- `matmul_ogs_details/opt_flags_details/opt_flags_nvidia.py`
+- `routing.py`
+- `routing_details/_expt_data.py`
+- `routing_details/_routing_compute.py`
+- `reduction_details/reduce_bitmatrix.py`
+
+### Files introduced in `v3.7.0` (not present in `v3.5.1`)
+
+These were added in Triton commit `c69c3a954` ("Reland refactor of
+tensor/layout/distributed"). They provide distributed MoE primitives
+(`ExptAssignment`, symmetric memory all-reduce, bitmatrix routing):
+
+- `distributed.py`
+- `reduce.py`
+- `roofline.py`
+- `tensor_details/bitmatrix.py`
+- `tensor_details/bitmatrix_details/sum_bitmatrix_rows.py`
+- `tensor_details/ragged_tensor.py`
+
+### Files present in both `v3.5.1` and `v3.7.0`
+
+The remaining files (`__init__.py`, `compaction.py`, `numerics.py`,
+`proton_opts.py`, `specialize.py`, `swiglu.py`, `target_info.py`, `tensor.py`,
+`testing.py`, `topk.py`, and their `_details/` subdirectories, plus
+`tensor_details/layout.py` and `tensor_details/layout_details/`) are present
+in both tags. The image may contain either version; no diffing was performed.
+
+Additionally, `v3.7.0` introduced `matmul.py` and `matmul_details/` (a
+replacement for the removed `matmul_ogs` module with a different API). The
+cstechdev image does **not** contain `matmul.py` or `matmul_details/`,
+confirming the v3.7.0 files were selectively merged rather than taken wholesale.
+
+### Build harness behavior
+
+The build harness used `TRITON_KERNELS_SRC_DIR` pointing to a **custom local
+checkout** that combined content from both `v3.5.1` (for `matmul_ogs`) and
+`v3.7.0` (for `distributed.py` and tensor layout refactors). This is not
+achievable with any single public Triton tag.
+
+### Impact on lucifer builds
+
+Our `Dockerfile.lucifer` clones `triton-lang/triton` at tag `v3.7.0` and passes
+it via `TRITON_KERNELS_SRC_DIR`. This means:
+
+- **Missing**: `matmul_ogs.py` and friends → causes `No module named
+  'triton_kernels.matmul_ogs'` errors at startup in vLLM 0.22.x (which
+  imports it in `config.py` and `mxfp4.py`).
+- **Present**: `distributed.py`, `reduce.py`, etc.
+- **Extra**: `matmul.py`, `matmul_details/` (present in v3.7.0 but absent
+  from cstechdev).
+
+The missing `matmul_ogs` import is caught by a `try/except` and logged as
+an error. It has **no runtime impact** when using `DEEPGEMM_MXFP4` as the MoE
+backend (which both cstechdev1 and lucifer2 resolve to). It would only matter
+if using `Mxfp4MoeBackend.TRITON` or `AITER_MXFP4_FP8`.
+
+**Fix**: clone `v3.5.1` instead of `v3.7.0`, or merge files from both tags
+to match cstechdev. Using `v3.5.1` alone would restore `matmul_ogs` but lose
+the v3.7.0 distributed primitives (which are also unused at TP=2).
 
 ---
 
