@@ -4,14 +4,10 @@
 #                + DeepGEMM #324 (MXFP4xMXFP8 MoE)
 #                on CUDA 13.2 / Ubuntu 24.04 / Python 3.12
 #
-# Cherry-picks / patches applied on top of vLLM base commit:
-#   - upstream #42879 (b372ad3e90) : stream DeepSeek DSML tool-call arg deltas
-#   - upstream #42784 (b90c4950db) : Eagle/MTP SWA cache block mask fix
-#
-# FlashInfer: PR #3395 pre-force-push tip (9ad3567d85e4)
+# FlashInfer: PR #3395
 #   adds sparse_mla_sm120 JIT kernels + BatchSparseMLAPagedAttentionWrapper
 #
-# DeepGEMM: PR #324 snapshot (1f2f161)
+# DeepGEMM: PR #324
 #   adds SM120 MXFP4xMXFP8 block-scaled MMA headers
 #
 # Build:
@@ -106,21 +102,14 @@ WORKDIR /build
 RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /build/cutlass && \
     grep "CUTLASS_MAJOR\|CUTLASS_MINOR\|CUTLASS_PATCH" /build/cutlass/include/cutlass/version.h | head -3
 
-# -- Clone vLLM; fetch force-pushed PR commit by SHA
-#    1967a5627bc3: "fix(sm120): pass scratch for small prefill chunks"
+# -- Clone vLLM + apply rebased #43477 (lucifer PR - "Enable DeepSeek V4 and GLM-5.1 on SM120")
 RUN git clone --no-checkout https://github.com/vllm-project/vllm.git /build/vllm
 WORKDIR /build/vllm
-RUN git fetch origin 1967a5627bc3710b680bbec24ecb99aaddedf22b && \
-    git checkout FETCH_HEAD
-RUN git config user.email "build@docker" && git config user.name "build"
-
-# Cherry-pick 1: upstream #42879 (merged as b372ad3e90) -- stream DSML tool-call arg deltas
-RUN git fetch origin b372ad3e9018f032478619adbc7f7fdcc9318212 && \
-    git cherry-pick --no-commit b372ad3e9018f032478619adbc7f7fdcc9318212
-
-# Cherry-pick 2: upstream #42784 backport (b90c4950db) -- Eagle/MTP SWA cache block mask fix
-RUN git fetch origin b90c4950db520998a97809e1268fc491badd88bc && \
-    git cherry-pick --no-commit b90c4950db520998a97809e1268fc491badd88bc
+COPY patches/lucifer.patch /tmp/lucifer.patch
+RUN git fetch origin 469f3dcf1d70349d0776ef82bdc5c4aff20a93f2 && \
+    git checkout FETCH_HEAD && \
+    git config user.email "build@docker" && git config user.name "build" && \
+    git apply /tmp/lucifer.patch && git add . && git commit -m "Apply lucifer.patch (rebased #43477)"
 
 # -- Install vLLM Python deps (without torch)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -196,16 +185,16 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 RUN python -c "import torch; v=torch.__version__; print(f'PyTorch {v}'); assert 'cu13' in v, f'WRONG TORCH: {v}'"
 
 # =============================================================================
-# Stage 3: DeepGEMM at 1f2f161 (MXFP4xMXFP8 SM120 MoE)
+# Stage 3: DeepGEMM PR #324
 # =============================================================================
 FROM lucifer-deps AS lucifer-deepgemm
 
 WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/pip \
-    git clone https://github.com/deepseek-ai/DeepGEMM.git && \
+    git clone --no-checkout https://github.com/deepseek-ai/DeepGEMM.git && \
     cd DeepGEMM && \
-    git fetch origin pull/324/head:pr-324 && \
-    git checkout 1f2f161 && \
+    git fetch origin aced12c2c8882a945c568ace9d4a7e5778aae410 && \
+    git checkout FETCH_HEAD && \
     git submodule update --init --recursive && \
     pip install --no-build-isolation --no-deps .
 
@@ -213,7 +202,7 @@ RUN python -c "import deep_gemm; print('DeepGEMM OK')" || \
     python -c "import importlib, sys; m=importlib.util.find_spec('deep_gemm'); print('DeepGEMM spec:', m)"
 
 # =============================================================================
-# Stage 4: FlashInfer at 9ad3567d (PR #3395 sparse MLA SM120)
+# Stage 4: FlashInfer  PR #3395
 # =============================================================================
 FROM lucifer-deepgemm AS lucifer-flashinfer
 
@@ -232,16 +221,14 @@ RUN --mount=type=cache,target=/root/.cache/uv \
         "tqdm==4.67.3"
 
 WORKDIR /build
-RUN git clone --filter=blob:none --no-checkout https://github.com/flashinfer-ai/flashinfer.git
+RUN git clone --no-checkout https://github.com/flashinfer-ai/flashinfer.git
 WORKDIR /build/flashinfer
 
-# PR #3395 pre-force-push commit (dangling ref, fetchable by SHA)
-RUN git fetch origin 9ad3567d85e46abcda8ba5140a5e6125b18c91f0 && \
+RUN git fetch origin b41aa8dd2fb93c49b1c6134bd1953040f8089d51 && \
     git checkout FETCH_HEAD && \
     git submodule update --init --recursive
 
 RUN --mount=type=cache,target=/root/.cache/pip \
-    echo "=== FlashInfer 9ad3567d: sparse MLA SM120 (PR #3395 pre-force-push) ===" && \
     FLASHINFER_CUDA_ARCH_LIST="12.0a" \
     FLASHINFER_ENABLE_SM90=0 \
     MAX_JOBS=${MAX_JOBS} \
@@ -249,7 +236,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 ENV FLASHINFER_DISABLE_VERSION_CHECK=1
 RUN python -c "import flashinfer; print(f'FlashInfer: {getattr(flashinfer, \"__version__\", \"source-install\")}')"
-RUN python -c "from flashinfer import BatchSparseMLAPagedAttentionWrapper; print('BatchSparseMLAPagedAttentionWrapper OK')"
+RUN python -c "from flashinfer import BatchMLAPagedAttentionWrapper; print('BatchMLAPagedAttentionWrapper OK')"
 
 # =============================================================================
 # Stage 5: Build vLLM from source
