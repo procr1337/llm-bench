@@ -1,5 +1,5 @@
 #!/bin/bash
-set -euo pipefail
+set -eu
 name="$1"
 cd "$(dirname "$0")"
 mkdir -p results/"$name"
@@ -13,6 +13,11 @@ else
   echo "Unsupported TP value: $TP"
   exit 1
 fi
+
+echo "Waiting for startup"
+while ! docker logs "$name" 2>&1 | grep -qs "Application startup complete"; do
+  sleep 1
+done
 
 echo "Running benchmark"
 OPTS=(
