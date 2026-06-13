@@ -16,6 +16,9 @@
 #   Taken from voipmonitor/dsv4-flash:lucifer-mxfp4-cutlass-20260603
 #   and rebased onto vllm main: ./patches/cutlass_moe.patch
 #
+# Custom fix for missing TileLang kernel warmup which caused a lot of JIT
+# compiles during serving on a cold cache
+#
 # Dependency versions and various env vars are taken from cstechdev image.
 #
 # VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096 is set because the default
@@ -121,11 +124,6 @@ RUN git fetch origin 469f3dcf1d70349d0776ef82bdc5c4aff20a93f2 && \
     git checkout FETCH_HEAD && \
     git config user.email "build@docker" && git config user.name "build" && \
     git apply /tmp/lucifer.patch && git add . && git commit -m "Apply lucifer.patch (rebased #43477)"
-
-# -- apply CUTLASS MoE patch (taken from voipmonitor/dsv4-flash:lucifer-mxfp4-cutlass-20260603 and rebased)
-COPY patches/cutlass_moe.patch /tmp/cutlass_moe.patch
-RUN git apply /tmp/cutlass_moe.patch && rm /tmp/cutlass_moe.patch && \
-    git add . && git commit -m "Apply cutlass MoE patch"
 
 # -- Install vLLM Python deps (without torch)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -275,6 +273,16 @@ RUN --mount=type=cache,target=/root/.ccache \
     MAX_JOBS=${MAX_JOBS} \
     NVCC_THREADS=${NVCC_THREADS} \
     pip install --no-build-isolation --no-deps -e . 2>&1
+
+# -- apply CUTLASS MoE patch (taken from voipmonitor/dsv4-flash:lucifer-mxfp4-cutlass-20260603 and rebased)
+COPY patches/cutlass_moe.patch /tmp/cutlass_moe.patch
+RUN git apply /tmp/cutlass_moe.patch && rm /tmp/cutlass_moe.patch && \
+    git add . && git commit -m "Apply cutlass MoE patch"
+
+# -- apply custom patch to warm up TileLang kernels at startup to avoid JIT compiles during serving on a cold cache
+COPY patches/tilelang_warmup.patch /tmp/tilelang_warmup.patch
+RUN git apply /tmp/tilelang_warmup.patch && rm /tmp/tilelang_warmup.patch && \
+    git add . && git commit -m "Apply tilelang_warmup.patch"
 
 RUN python -c "import vllm; print(f'vLLM {vllm.__version__}')"
 
