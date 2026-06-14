@@ -1,0 +1,287 @@
+commit cba791ce5acbeb19e57852a94210d74fff9f4971
+Author: Procr <193802945+procr1337@users.noreply.github.com>
+Date:   Sun Jun 14 18:59:42 2026 +0000
+
+    fix(deepseek_v4): recover tool calls trapped by a dangling </think>
+    
+    DeepSeek-V4-Flash occasionally omits the closing </think> before emitting a
+    <｜DSML｜tool_calls> block. This is a model bug: the chat template / encoder
+    explicitly instructs it to output its complete reasoning inside <think>...
+    </think> BEFORE any tool calls or final response, and the model intermittently
+    fails to follow that instruction. Reasoning extraction is gated on </think>, so
+    when it is missing the entire tool-call block stays in the reasoning channel,
+    the tool parser never sees it, and the call is silently lost
+    (finish_reason=stop, empty content). This is malformed model output, not a
+    parser/template bug: it reproduces on the upstream DeepSeek API for V4-Flash
+    and is invariant to MTP/cutlass/concurrency. DeepSeek's own encoding README
+    notes the model can emit malformed output and that production needs "additional
+    error handling". See bench/dangling-think/ for the full investigation and repro
+    tooling.
+    
+    Workaround: a narrowly-scoped, opt-in recovery in DelegatingParser that
+    promotes a tool-call block trapped in reasoning to a real tool call, framed
+    explicitly as malformed-output recovery (NOT making the tool-call token a
+    reasoning terminator).
+    
+    - ToolParser gains tool_call_start_token / tool_call_end_token and an opt-in
+      recovers_tool_calls_in_reasoning flag, so the generic composition code keys
+      off the declared interface instead of sniffing subclass internals.
+      DeepSeekV32ToolParser (and thus V4) opts in.
+    - Non-streaming: when auto tool-choice parsed zero tool calls and produced no
+      content, and the reasoning tail contains a *balanced* start/end tool-call
+      block, re-run the tool parser over it and keep the preceding prose as
+      reasoning. The balance requirement avoids promoting half-formed output or a
+      marker the model merely mentioned.
+    - Streaming: watch the reasoning stream for the start marker, buffering partial
+      markers across chunks so they never leak as reasoning; on a full marker, end
+      reasoning right before it and route the remainder to the tool-call phase.
+    - Tests exercise the composed reasoning+tool DelegatingParser (CPU-only, stub
+      tokenizer) for both the non-streaming and streaming dangling-</think> shapes.
+
+diff --git a/vllm/parser/abstract_parser.py b/vllm/parser/abstract_parser.py
+index 9f790737a..a437280f9 100644
+--- a/vllm/parser/abstract_parser.py
++++ b/vllm/parser/abstract_parser.py
+@@ -42,6 +42,7 @@ from vllm.tool_parsers.streaming import (
+     extract_named_tool_call_streaming,
+     extract_required_tool_call_streaming,
+ )
++from vllm.tool_parsers.utils import partial_tag_overlap
+ from vllm.utils import random_uuid
+ from vllm.utils.mistral import is_mistral_tool_parser
+ 
+@@ -79,6 +80,9 @@ class StreamState:
+     previous_token_ids: list[int] = field(default_factory=list)
+     history_tool_call_cnt: int = 0
+     tool_call_id_type: str = "random"
++    # Reasoning text withheld from output because it might be the start of a
++    # dangling tool-call marker (model omitted </think> before the tool call).
++    pending_reasoning: str = ""
+     # only used for "required" and "named tool" choices,
+     # tracks whether function name has been fully returned in the stream yet
+     function_name_returned: bool = False
+@@ -826,8 +830,158 @@ class DelegatingParser(Parser):
+             request=request,
+             enable_auto_tools=enable_auto_tools,
+         )
++
++        # Dangling-</think> recovery: the model occasionally emits a complete
++        # tool-call block without first closing the reasoning channel. The whole
++        # block then stays trapped in `reasoning`, the tool parser never sees it,
++        # and the call is silently lost. If nothing else was parsed, re-run the
++        # tool parser over the reasoning tail and promote a balanced block.
++        if not tool_calls and self._can_recover_trapped_tool_calls(
++            request, content, enable_auto_tools
++        ):
++            recovered, reasoning = self._recover_tool_calls_from_reasoning(
++                reasoning, request
++            )
++            if recovered:
++                tool_calls = recovered
++
+         return reasoning, content, tool_calls
+ 
++    def _can_recover_trapped_tool_calls(
++        self,
++        request: ChatCompletionRequest | ResponsesRequest,
++        content: str | None,
++        enable_auto_tools: bool,
++    ) -> bool:
++        """Whether to attempt dangling-</think> tool-call recovery.
++
++        Restricted to the automatic tool-choice path with no surfaced content,
++        which is the signature of a reasoning channel that never closed. Named
++        and required tool choices have their own handling and are left alone.
++        """
++        if self._tool_parser is None or not enable_auto_tools:
++            return False
++        if request.tool_choice not in ("auto", None):
++            return False
++        if content is not None and content.strip():
++            return False
++        return self._tool_parser_recovers_in_reasoning()
++
++    def _tool_parser_recovers_in_reasoning(self) -> bool:
++        """Whether the tool parser opts into dangling-reasoning recovery.
++
++        Driven solely by the declared ``ToolParser`` capability flag and its
++        start/end marker tokens; no parser internals are inspected.
++        """
++        tp = self._tool_parser
++        return bool(
++            tp is not None
++            and tp.recovers_tool_calls_in_reasoning
++            and tp.tool_call_start_token
++            and tp.tool_call_end_token
++        )
++
++    def _recover_tool_calls_from_reasoning(
++        self,
++        reasoning: str | None,
++        request: ChatCompletionRequest | ResponsesRequest,
++    ) -> tuple[list[FunctionCall] | None, str | None]:
++        """Promote a tool-call block trapped in the reasoning channel.
++
++        Requires a *balanced* `<...tool_calls>...</...tool_calls>` block so we
++        never promote half-formed output or a marker the model merely mentioned
++        while reasoning. Returns the recovered calls and the leftover reasoning
++        prose (the text that preceded the block); on no-op the reasoning is
++        returned unchanged.
++        """
++        tool_parser = self._tool_parser
++        assert tool_parser is not None
++        start = tool_parser.tool_call_start_token
++        end = tool_parser.tool_call_end_token
++        if not reasoning or start not in reasoning or end not in reasoning:
++            return None, reasoning
++
++        info = tool_parser.extract_tool_calls(reasoning, request)  # type: ignore[arg-type]
++        if info is None or not info.tools_called:
++            return None, reasoning
++
++        recovered = [
++            FunctionCall(
++                id=tc.id,
++                name=tc.function.name,
++                arguments=tc.function.arguments,
++            )
++            for tc in info.tool_calls
++        ]
++        # The prose before the block was genuine reasoning; keep it as such.
++        new_reasoning = info.content
++        if new_reasoning and not new_reasoning.strip():
++            new_reasoning = None
++        return recovered, new_reasoning
++
++    def _intercept_dangling_tool_marker(
++        self,
++        state: "StreamState",
++        delta_message: DeltaMessage | None,
++        finished: bool,
++    ) -> tuple[DeltaMessage | None, str, bool]:
++        """Detect a tool-call start marker emitted while still reasoning.
++
++        Streaming counterpart of :meth:`_recover_tool_calls_from_reasoning`.
++        When the model omits ``</think>`` before a ``<...tool_calls>`` block the
++        reasoning channel never ends, so the block would otherwise be streamed
++        out as reasoning and the tool call lost. This watches the reasoning
++        stream for the start marker, buffering any trailing partial-marker text
++        so it is never leaked as reasoning.
++
++        Returns ``(delta_message, carry_text, ended)``. When ``ended`` is True,
++        the reasoning delta has been trimmed to stop right before the marker and
++        ``carry_text`` (marker + trailing text) should be handed to the
++        tool-call phase. Only applies to tool parsers that opt in via
++        ``recovers_tool_calls_in_reasoning``; others are left untouched.
++        """
++        if not self._tool_parser_recovers_in_reasoning():
++            return delta_message, "", False
++        start = self._tool_parser.tool_call_start_token
++
++        reasoning_delta = (
++            delta_message.reasoning
++            if delta_message and delta_message.reasoning
++            else ""
++        )
++        # Nothing buffered and nothing new to inspect: leave the delta as-is.
++        if not reasoning_delta and not state.pending_reasoning:
++            return delta_message, "", False
++
++        buf = state.pending_reasoning + reasoning_delta
++        idx = buf.find(start)
++        if idx != -1:
++            # Full marker found: emit reasoning up to it, hand off the rest.
++            state.pending_reasoning = ""
++            emitted = buf[:idx]
++            carry = buf[idx:]
++            if delta_message is None:
++                delta_message = DeltaMessage()
++            delta_message.reasoning = emitted or None
++            delta_message.content = None
++            return delta_message, carry, True
++
++        # No full marker. Withhold any trailing run that could begin one, unless
++        # the stream has finished (in which case it was never a marker).
++        overlap = 0 if finished else partial_tag_overlap(buf, start)
++        emitted = buf[: len(buf) - overlap] if overlap else buf
++        state.pending_reasoning = buf[len(buf) - overlap :] if overlap else ""
++
++        if not emitted:
++            # Everything is withheld this round; emit no reasoning.
++            if delta_message is not None:
++                delta_message.reasoning = None
++            return delta_message, "", False
++        if delta_message is None:
++            delta_message = DeltaMessage()
++        delta_message.reasoning = emitted
++        return delta_message, "", False
++
+     def parse_delta(
+         self,
+         delta_text: str,
+@@ -872,6 +1026,21 @@ class DelegatingParser(Parser):
+                 )
+                 delta_text = current_text
+                 delta_token_ids = current_token_ids
++            else:
++                # Dangling-</think> recovery: the model emitted a tool-call
++                # marker without first closing the reasoning channel. Detect it
++                # mid-stream, stop reasoning right before it, and hand the
++                # marker (plus the rest) to the tool-call phase below.
++                delta_message, carry_text, marker_ended = (
++                    self._intercept_dangling_tool_marker(
++                        state, delta_message, finished=finished
++                    )
++                )
++                if marker_ended:
++                    state.reasoning_ended = True
++                    current_text = carry_text
++                    delta_text = carry_text
++                    delta_token_ids = current_token_ids
+ 
+         # Tool call extraction
+         if self._in_tool_call_phase(state):
+diff --git a/vllm/tool_parsers/abstract_tool_parser.py b/vllm/tool_parsers/abstract_tool_parser.py
+index 94543b823..ad11411e2 100644
+--- a/vllm/tool_parsers/abstract_tool_parser.py
++++ b/vllm/tool_parsers/abstract_tool_parser.py
+@@ -58,6 +58,23 @@ class ToolParser:
+     # required/named tool_choice, treating them the same as "auto".
+     supports_required_and_named: bool = True
+ 
++    # The literal tokens that wrap a tool-call block, when the model's format
++    # uses them. Optional: only parsers whose grammar has explicit start/end
++    # markers set these. Declared here so generic composition code (e.g.
++    # DelegatingParser) can reference them through the interface instead of
++    # sniffing subclass internals.
++    tool_call_start_token: str | None = None
++    tool_call_end_token: str | None = None
++
++    # Opt in to dangling-reasoning recovery. Some models occasionally emit a
++    # complete tool-call block without first closing the reasoning channel
++    # (e.g. a missing </think>), which would otherwise trap the block in the
++    # reasoning output and lose the tool call. When True, DelegatingParser is
++    # allowed to treat tool_call_start_token as an implicit reasoning boundary
++    # and route the block to this parser. Requires tool_call_start_token and
++    # tool_call_end_token to be set.
++    recovers_tool_calls_in_reasoning: bool = False
++
+     def __init__(
+         self,
+         tokenizer: TokenizerLike,
+diff --git a/vllm/tool_parsers/deepseekv32_tool_parser.py b/vllm/tool_parsers/deepseekv32_tool_parser.py
+index 7d5e299be..df61b2209 100644
+--- a/vllm/tool_parsers/deepseekv32_tool_parser.py
++++ b/vllm/tool_parsers/deepseekv32_tool_parser.py
+@@ -53,6 +53,11 @@ class DeepSeekV32ToolParser(ToolParser):
+ 
+     tool_call_start_token: str = "<｜DSML｜function_calls>"
+     tool_call_end_token: str = "</｜DSML｜function_calls>"
++    # Workaround for a model defect: DeepSeek occasionally emits a tool-call
++    # block without first closing reasoning (a missing </think>), which would
++    # otherwise trap the block in reasoning and lose the call. Opt in so
++    # DelegatingParser can recover it.
++    recovers_tool_calls_in_reasoning: bool = True
+ 
+     def __init__(self, tokenizer: TokenizerLike, tools: list[Tool] | None = None):
+         super().__init__(tokenizer, tools)

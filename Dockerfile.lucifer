@@ -16,8 +16,9 @@
 #   Taken from voipmonitor/dsv4-flash:lucifer-mxfp4-cutlass-20260603
 #   and rebased onto vllm main: ./patches/cutlass_moe.patch
 #
-# Custom fix for missing TileLang kernel warmup which caused a lot of JIT
-# compiles during serving on a cold cache
+# Tool-call fix:
+#   Workaround for model misbehavior where it outputs tool calls inside reasoning stream:
+#   https://github.com/procr1337/vllm/pull/1
 #
 # Dependency versions and various env vars are taken from cstechdev image.
 #
@@ -279,10 +280,10 @@ COPY patches/cutlass_moe.patch /tmp/cutlass_moe.patch
 RUN git apply /tmp/cutlass_moe.patch && rm /tmp/cutlass_moe.patch && \
     git add . && git commit -m "Apply cutlass MoE patch"
 
-# -- apply custom patch to warm up TileLang kernels at startup to avoid JIT compiles during serving on a cold cache
-COPY patches/tilelang_warmup.patch /tmp/tilelang_warmup.patch
-RUN git apply /tmp/tilelang_warmup.patch && rm /tmp/tilelang_warmup.patch && \
-    git add . && git commit -m "Apply tilelang_warmup.patch"
+# -- apply tool-call fix patch
+COPY patches/ds-toolcall-fix.patch /tmp/ds-toolcall-fix.patch
+RUN git apply /tmp/ds-toolcall-fix.patch && rm /tmp/ds-toolcall-fix.patch && \
+    git add . && git commit -m "Apply ds-toolcall-fix.patch"
 
 RUN python -c "import vllm; print(f'vLLM {vllm.__version__}')"
 
