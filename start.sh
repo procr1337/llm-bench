@@ -277,7 +277,7 @@ lucifer1_cutlass() {
 
 lucifer2() {
   NAME=lucifer2
-  IMAGE=hg436/vllm-public:lucifer-9d9a0a0
+  IMAGE=hg436/vllm-public:lucifer-4f159ff
 
   OPTS=(
     "${DOCKER_COMMON[@]}"
@@ -300,7 +300,7 @@ lucifer2() {
 
 lucifer2_cutlass() {
   NAME=lucifer2_cutlass
-  IMAGE=hg436/vllm-public:lucifer-9d9a0a0
+  IMAGE=hg436/vllm-public:lucifer-4f159ff
 
   OPTS=(
     "${DOCKER_COMMON[@]}"
