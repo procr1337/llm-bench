@@ -38,6 +38,7 @@ DOCKER_COMMON=(
   -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
 )
 
+# graph cap = max num seq * (1 + MTP)
 VLLM_COMMON=(
   deepseek-ai/DeepSeek-V4-Flash
   --max-model-len "$MAX_MODEL_LEN"
@@ -325,6 +326,35 @@ lucifer2_cutlass() {
   docker rm -f "$NAME"
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
+
+lucifer3_cutlass() {
+  NAME=lucifer3_cutlass
+  IMAGE=hg436/vllm-public:lucifer-6921002
+
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    "$IMAGE"
+    serve "${VLLM_COMMON[@]}"
+    --gpu-memory-utilization 0.95
+    --load-format instanttensor
+    --max-num-seqs 64
+    --max-cudagraph-capture-size 192
+    --async-scheduling
+    --no-scheduler-reserve-full-isl
+    --max-num-batched-tokens 8192
+    --enable-chunked-prefill
+    --kernel-config.moe_backend flashinfer_cutlass
+    --speculative-config.method mtp
+    --speculative-config.num_speculative_tokens 2
+  )
+
+  docker rm -f "$NAME"
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
 
 docker stop -t1 \
   voipmonitor1 \
