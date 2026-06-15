@@ -2,7 +2,7 @@
 # Lucifer stack:
 #   vLLM main
 #   + rebase of vLLM #43477 (./patches/lucifer.patch)
-#   + FlashInfer #3395 (sparse MLA SM120)
+#   + FlashInfer w/ #3395 merged (sparse MLA SM120)
 #   + DeepGEMM #324 (MXFP4xMXFP8 MoE)
 #   on CUDA 13.2 / Ubuntu 24.04 / Python 3.12
 #
@@ -46,7 +46,7 @@ ARG CMAKE_CUDA_ARCHITECTURES="120a"
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS lucifer-base
 
 ARG PYTHON_VERSION
-ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
 ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
@@ -114,17 +114,19 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
 WORKDIR /build
 
 # CUTLASS -- latest main for SM120a headers required by vLLM + FlashInfer
-RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /build/cutlass && \
-    grep "CUTLASS_MAJOR\|CUTLASS_MINOR\|CUTLASS_PATCH" /build/cutlass/include/cutlass/version.h | head -3
+RUN git clone --depth 1 https://github.com/NVIDIA/cutlass.git /build/cutlass
 
 # -- Clone vLLM + apply rebased #43477 (lucifer PR - "Enable DeepSeek V4 and GLM-5.1 on SM120")
 RUN git clone --no-checkout https://github.com/vllm-project/vllm.git /build/vllm
 WORKDIR /build/vllm
-COPY patches/lucifer.patch /tmp/lucifer.patch
-RUN git fetch origin 469f3dcf1d70349d0776ef82bdc5c4aff20a93f2 && \
+COPY patches/lucifer1.patch /tmp/
+RUN git fetch origin 0d80979644e0237b6ef02ce0601dc0bd654e357b && \
     git checkout FETCH_HEAD && \
     git config user.email "build@docker" && git config user.name "build" && \
-    git apply /tmp/lucifer.patch && git add . && git commit -m "Apply lucifer.patch (rebased #43477)"
+    git apply /tmp/lucifer1.patch && \
+    git add . && \
+    git commit -m "Apply lucifer1.patch (rebased #43477)" && \
+    rm /tmp/lucifer1.patch
 
 # -- Install vLLM Python deps (without torch)
 RUN --mount=type=cache,target=/root/.cache/uv \
@@ -209,7 +211,7 @@ WORKDIR /build
 RUN --mount=type=cache,target=/root/.cache/pip \
     git clone --no-checkout https://github.com/deepseek-ai/DeepGEMM.git && \
     cd DeepGEMM && \
-    git fetch origin aced12c2c8882a945c568ace9d4a7e5778aae410 && \
+    git fetch origin 33a715e3d9634b64a351855c74ad64e2d9359c7e && \
     git checkout FETCH_HEAD && \
     git submodule update --init --recursive && \
     pip install --no-build-isolation --no-deps .
@@ -218,7 +220,7 @@ RUN python -c "import deep_gemm; print('DeepGEMM OK')" || \
     python -c "import importlib, sys; m=importlib.util.find_spec('deep_gemm'); print('DeepGEMM spec:', m)"
 
 # =============================================================================
-# Stage 4: FlashInfer  PR #3395
+# Stage 4: FlashInfer PR #3395
 # =============================================================================
 FROM lucifer-deepgemm AS lucifer-flashinfer
 
@@ -240,6 +242,11 @@ WORKDIR /build
 RUN git clone --no-checkout https://github.com/flashinfer-ai/flashinfer.git
 WORKDIR /build/flashinfer
 
+# f954694781093138ade24034cc7bd3944c9a94eb: merged main
+# b41aa8dd2fb93c49b1c6134bd1953040f8089d51: some early version of the PR before refactors
+#   - no functional kernel differences, just defense in depth safety fixes and API changes
+#   - this is what current lucifer PR depends on
+#RUN git fetch origin f954694781093138ade24034cc7bd3944c9a94eb && \
 RUN git fetch origin b41aa8dd2fb93c49b1c6134bd1953040f8089d51 && \
     git checkout FETCH_HEAD && \
     git submodule update --init --recursive
@@ -274,6 +281,11 @@ RUN --mount=type=cache,target=/root/.ccache \
     MAX_JOBS=${MAX_JOBS} \
     NVCC_THREADS=${NVCC_THREADS} \
     pip install --no-build-isolation --no-deps -e . 2>&1
+
+# -- apply Python-only Lucifer patches
+COPY patches/lucifer2.patch /tmp/
+RUN git apply /tmp/lucifer2.patch && rm /tmp/lucifer2.patch && \
+    git add . && git commit -m "Apply lucifer patch 2"
 
 # -- apply CUTLASS MoE patch (taken from voipmonitor/dsv4-flash:lucifer-mxfp4-cutlass-20260603 and rebased)
 COPY patches/cutlass_moe.patch /tmp/cutlass_moe.patch
@@ -314,7 +326,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --force-reinstall nvidia-cublas==13.1.0.3 && \
     python -c "import torch; print(f'torch {torch.__version__} OK')"
 
-# Clean up build artefacts but not pip/uv caches (those are mounted)
+# Clean up build artifacts but not pip/uv caches (those are mounted)
 RUN find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true && \
     find /opt/venv -name "*.pyc" -delete 2>/dev/null || true && \
     find /opt/venv -name "*.a" -delete 2>/dev/null || true
@@ -324,10 +336,10 @@ RUN find /opt/venv -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || 
 # =============================================================================
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu${UBUNTU_VERSION} AS lucifer-vllm-cu132
 
-ARG PYTHON_VERSION=3.12
-ARG UBUNTU_VERSION=24.04
+ARG PYTHON_VERSION
+ARG UBUNTU_VERSION
 ARG TORCH_CUDA_ARCH_LIST
-ARG DEBIAN_FRONTEND=noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

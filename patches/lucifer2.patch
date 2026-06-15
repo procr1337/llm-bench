@@ -1,179 +1,18 @@
-commit 5bea04e6c6b0c2920dcc3df699bccbf15575e0e8
+commit 4154d4aa5e4516a40cf9c58e9befea81202eae22
 Author: Procr <193802945+procr1337@users.noreply.github.com>
-Date:   Sun Jun 7 16:10:00 2026 +0000
+Date:   Mon Jun 15 17:43:07 2026 +0000
 
-    feat(dsv4): add SM120 sparse MLA support
+    lucifer PR #43477: DeepSeek V4 / GLM-5.1 SM120 runtime support
     
-    Add the DeepSeek V4 SM120 FlashInfer sparse MLA backend path, cache layout handling, warmup/autotune helpers, and related DeepGEMM warmup coverage.
+    Python/runtime portion of the lucifer rebase of vLLM #43477: model code,
+    sparse-MLA attention backends (incl. flashinfer SM120 sparse path), DeepGEMM
+    and FlashInfer wrappers, warmup, backend selection, tests, and docs.
     
-    Keep the PR branch based directly on upstream/main as a single commit so the fork push does not need to update upstream workflow files.
+    Contains no build-config changes, so it can be applied after the vLLM build
+    (like the other runtime patches).
 
-diff --git a/cmake/external_projects/deepgemm.cmake b/cmake/external_projects/deepgemm.cmake
-index 183c42dc7..564c5428a 100644
---- a/cmake/external_projects/deepgemm.cmake
-+++ b/cmake/external_projects/deepgemm.cmake
-@@ -8,35 +8,57 @@ if (DEFINED ENV{DEEPGEMM_SRC_DIR})
-   set(DEEPGEMM_SRC_DIR $ENV{DEEPGEMM_SRC_DIR})
- endif()
- 
-+# Local tree: set deepgemm_SOURCE_DIR directly (no FetchContent download).
-+# Upstream git: use FetchContent_Populate with explicit options (CMP0169 NEW
-+# disallows one-argument Populate(dep) after Declare; MakeAvailable would run
-+# DeepGEMM's top-level CMakeLists.txt, which vLLM must not load).
- if(DEEPGEMM_SRC_DIR)
--  FetchContent_Declare(
--    deepgemm
--    SOURCE_DIR ${DEEPGEMM_SRC_DIR}
--    CONFIGURE_COMMAND ""
--    BUILD_COMMAND ""
--  )
-+  # cmake_path(ABSOLUTE_PATH <var> ...) reads the path from <var>; NORMALIZE is a
-+  # flag (no trailing path argument). Resolve relative paths against vLLM root.
-+  set(_deepgemm_user_src "${DEEPGEMM_SRC_DIR}")
-+  cmake_path(ABSOLUTE_PATH _deepgemm_user_src
-+    BASE_DIRECTORY "${CMAKE_SOURCE_DIR}"
-+    NORMALIZE)
-+  set(DEEPGEMM_SRC_DIR "${_deepgemm_user_src}")
-+  if(NOT IS_DIRECTORY "${DEEPGEMM_SRC_DIR}")
-+    message(FATAL_ERROR
-+      "DEEPGEMM_SRC_DIR is not an existing directory: '${DEEPGEMM_SRC_DIR}'")
-+  endif()
-+  set(deepgemm_SOURCE_DIR "${DEEPGEMM_SRC_DIR}")
-+  message(STATUS "DeepGEMM using local DEEPGEMM_SRC_DIR: ${deepgemm_SOURCE_DIR}")
- else()
--  # This ref should be kept in sync with tools/install_deepgemm.sh
--  FetchContent_Declare(
--    deepgemm
--    GIT_REPOSITORY https://github.com/deepseek-ai/DeepGEMM.git
--    GIT_TAG 891d57b4db1071624b5c8fa0d1e51cb317fa709f
--    GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
--    GIT_PROGRESS TRUE
--    CONFIGURE_COMMAND ""
--    BUILD_COMMAND ""
--  )
--endif()
-+  # Keep in sync with tools/install_deepgemm.sh
-+  set(_DEEPGEMM_UPSTREAM_REPO "https://github.com/deepseek-ai/DeepGEMM.git")
-+  set(_DEEPGEMM_UPSTREAM_TAG "891d57b4db1071624b5c8fa0d1e51cb317fa709f")
-+
-+  set(_deepgemm_fc_root "${FETCHCONTENT_BASE_DIR}")
-+  if(NOT _deepgemm_fc_root)
-+    set(_deepgemm_fc_root "${CMAKE_BINARY_DIR}/_deps")
-+  endif()
-+  set(_deepgemm_src "${_deepgemm_fc_root}/deepgemm-src")
-+  set(_deepgemm_bin "${_deepgemm_fc_root}/deepgemm-build")
-+  set(_deepgemm_sub "${_deepgemm_fc_root}/deepgemm-subbuild")
- 
--# Use FetchContent_Populate (not MakeAvailable) to avoid processing
--# DeepGEMM's own CMakeLists.txt which has incompatible find_package calls.
--FetchContent_GetProperties(deepgemm)
--if(NOT deepgemm_POPULATED)
--  FetchContent_Populate(deepgemm)
-+  if(EXISTS "${_deepgemm_src}/csrc/python_api.cpp")
-+    set(deepgemm_SOURCE_DIR "${_deepgemm_src}")
-+    set(deepgemm_BINARY_DIR "${_deepgemm_bin}")
-+  else()
-+    FetchContent_Populate(
-+      deepgemm
-+      SUBBUILD_DIR "${_deepgemm_sub}"
-+      SOURCE_DIR "${_deepgemm_src}"
-+      BINARY_DIR "${_deepgemm_bin}"
-+      GIT_REPOSITORY "${_DEEPGEMM_UPSTREAM_REPO}"
-+      GIT_TAG "${_DEEPGEMM_UPSTREAM_TAG}"
-+      GIT_SUBMODULES "third-party/cutlass" "third-party/fmt"
-+      GIT_PROGRESS TRUE
-+    )
-+  endif()
-+  message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
- endif()
--message(STATUS "DeepGEMM is available at ${deepgemm_SOURCE_DIR}")
- 
--# DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100
-+# DeepGEMM requires CUDA 12.3+ for SM90, 12.9+ for SM100 (official upstream),
-+# 12.8+ for SM120 / SM12x family when using vLLM's CUDA arch naming (12.0f, 12.0a, …).
- set(DEEPGEMM_SUPPORT_ARCHS)
- if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.3)
-   list(APPEND DEEPGEMM_SUPPORT_ARCHS "9.0a")
-@@ -46,6 +68,9 @@ if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.9)
- elseif(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-   list(APPEND DEEPGEMM_SUPPORT_ARCHS "10.0a")
- endif()
-+if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
-+  list(APPEND DEEPGEMM_SUPPORT_ARCHS "12.0f" "12.0a" "12.1a")
-+endif()
- 
- cuda_archs_loose_intersection(DEEPGEMM_ARCHS
-   "${DEEPGEMM_SUPPORT_ARCHS}" "${CUDA_ARCHS}")
-diff --git a/cmake/external_projects/qutlass.cmake b/cmake/external_projects/qutlass.cmake
-index 273fe754b..d046a910d 100644
---- a/cmake/external_projects/qutlass.cmake
-+++ b/cmake/external_projects/qutlass.cmake
-@@ -6,25 +6,47 @@ if(DEFINED ENV{QUTLASS_SRC_DIR})
-   set(QUTLASS_SRC_DIR $ENV{QUTLASS_SRC_DIR})
- endif()
- 
-+# CMP0169 NEW: one-argument FetchContent_Populate(name) after Declare is invalid.
-+# Use explicit Populate(...) for git, or set SOURCE_DIR for local trees.
- if(QUTLASS_SRC_DIR)
--  FetchContent_Declare(
--    qutlass
--    SOURCE_DIR ${QUTLASS_SRC_DIR}
--    CONFIGURE_COMMAND ""
--    BUILD_COMMAND ""
--  )
-+  set(_qutlass_user_src "${QUTLASS_SRC_DIR}")
-+  cmake_path(ABSOLUTE_PATH _qutlass_user_src
-+    BASE_DIRECTORY "${CMAKE_SOURCE_DIR}"
-+    NORMALIZE)
-+  set(QUTLASS_SRC_DIR "${_qutlass_user_src}")
-+  if(NOT IS_DIRECTORY "${QUTLASS_SRC_DIR}")
-+    message(FATAL_ERROR
-+      "[QUTLASS] QUTLASS_SRC_DIR is not an existing directory: '${QUTLASS_SRC_DIR}'")
-+  endif()
-+  set(qutlass_SOURCE_DIR "${QUTLASS_SRC_DIR}")
-+  set(qutlass_BINARY_DIR "${CMAKE_BINARY_DIR}/qutlass-binary-dir-unused")
- else()
--  FetchContent_Declare(
--    qutlass
--    GIT_REPOSITORY https://github.com/IST-DASLab/qutlass.git
--    GIT_TAG 830d2c4537c7396e14a02a46fbddd18b5d107c65
--    GIT_PROGRESS TRUE
--    CONFIGURE_COMMAND ""
--    BUILD_COMMAND ""
--  )
--endif()
-+  set(_QUTLASS_UPSTREAM_REPO "https://github.com/IST-DASLab/qutlass.git")
-+  set(_QUTLASS_UPSTREAM_TAG "830d2c4537c7396e14a02a46fbddd18b5d107c65")
- 
--FetchContent_Populate(qutlass)
-+  set(_qutlass_fc_root "${FETCHCONTENT_BASE_DIR}")
-+  if(NOT _qutlass_fc_root)
-+    set(_qutlass_fc_root "${CMAKE_BINARY_DIR}/_deps")
-+  endif()
-+  set(_qutlass_src "${_qutlass_fc_root}/qutlass-src")
-+  set(_qutlass_bin "${_qutlass_fc_root}/qutlass-build")
-+  set(_qutlass_sub "${_qutlass_fc_root}/qutlass-subbuild")
-+
-+  if(EXISTS "${_qutlass_src}/qutlass/csrc/bindings.cpp")
-+    set(qutlass_SOURCE_DIR "${_qutlass_src}")
-+    set(qutlass_BINARY_DIR "${_qutlass_bin}")
-+  else()
-+    FetchContent_Populate(
-+      qutlass
-+      SUBBUILD_DIR "${_qutlass_sub}"
-+      SOURCE_DIR "${_qutlass_src}"
-+      BINARY_DIR "${_qutlass_bin}"
-+      GIT_REPOSITORY "${_QUTLASS_UPSTREAM_REPO}"
-+      GIT_TAG "${_QUTLASS_UPSTREAM_TAG}"
-+      GIT_PROGRESS TRUE
-+    )
-+  endif()
-+endif()
- 
- if(NOT qutlass_SOURCE_DIR)
-   message(FATAL_ERROR "[QUTLASS] source directory could not be resolved.")
 diff --git a/docs/design/attention_backends.md b/docs/design/attention_backends.md
-index 5d366253e..e63574ea1 100644
+index a585cd77f..b2a627656 100644
 --- a/docs/design/attention_backends.md
 +++ b/docs/design/attention_backends.md
 @@ -133,16 +133,6 @@ Priority is **1 = highest** (tried first).
@@ -193,7 +32,7 @@ index 5d366253e..e63574ea1 100644
  > **\*** For sparse MLA, FP8 KV cache always prefers `FLASHINFER_MLA_SPARSE`. With BF16 KV cache, `FLASHINFER_MLA_SPARSE` is preferred for low query-head counts (<= 16), while `FLASHMLA_SPARSE` is preferred otherwise.
  >
  > **Note:** ROCm and CPU platforms have their own selection logic. See the platform-specific documentation for details.
-@@ -218,7 +208,7 @@ MLA decode backends are selected using the standard
+@@ -219,7 +209,7 @@ MLA decode backends are selected using the standard
  | ------- | ------ | --------- | ----------- | ---------- | ---- | ---------- | ------ | --------- | --- | --------------- | ------------ |
  | `CUTLASS_MLA` | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3` | 128 | Any | ❌ | ❌ | ❌ | ❌ | ✅ | Decoder | 10.x |
  | `FLASHINFER_MLA` | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3` | 32, 64 | Any | ❌ | ❌ | ❌ | ❌ | ❌ | Decoder | 10.x |
@@ -784,10 +623,10 @@ index 7e6a83bb4..51285e408 100644
 +    assert dummy_runs == []
 diff --git a/tests/models/test_deepseek_v4_backend_selection.py b/tests/models/test_deepseek_v4_backend_selection.py
 new file mode 100644
-index 000000000..5ed71a293
+index 000000000..a6781d46f
 --- /dev/null
 +++ b/tests/models/test_deepseek_v4_backend_selection.py
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,316 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -936,6 +775,58 @@ index 000000000..5ed71a293
 +            use_mla=True,
 +            has_sink=False,
 +            use_sparse=True,
++            device_capability=DeviceCapability(12, 0),
++        )
++        == "kv_cache_dtype not supported"
++    )
++
++
++def test_dsv4_flashinfer_backend_validation_is_arch_specific(monkeypatch):
++    monkeypatch.setattr(
++        flashinfer_utils, "has_flashinfer_sparse_mla_sm120", lambda: True
++    )
++
++    backend_cls = dsv4_flashinfer.DeepseekV4FlashInferMLASparseBackend
++    assert backend_cls.supports_compute_capability(DeviceCapability(10, 0))
++    assert backend_cls.supports_compute_capability(DeviceCapability(12, 0))
++    assert not backend_cls.supports_compute_capability(DeviceCapability(9, 0))
++
++    base_kwargs = dict(
++        head_size=512,
++        dtype=torch.bfloat16,
++        block_size=256,
++        use_mla=True,
++        has_sink=False,
++        use_sparse=True,
++    )
++    assert (
++        backend_cls.supports_combination(
++            **base_kwargs,
++            kv_cache_dtype="fp8",
++            device_capability=DeviceCapability(10, 0),
++        )
++        is None
++    )
++    assert (
++        backend_cls.supports_combination(
++            **base_kwargs,
++            kv_cache_dtype="fp8_ds_mla",
++            device_capability=DeviceCapability(10, 0),
++        )
++        is not None
++    )
++    assert (
++        backend_cls.supports_combination(
++            **base_kwargs,
++            kv_cache_dtype="fp8",
++            device_capability=DeviceCapability(12, 0),
++        )
++        is None
++    )
++    assert (
++        backend_cls.supports_combination(
++            **base_kwargs,
++            kv_cache_dtype="auto",
 +            device_capability=DeviceCapability(12, 0),
 +        )
 +        == "kv_cache_dtype not supported"
@@ -1255,7 +1146,7 @@ index 22acc748d..6e389604c 100644
      batch_spec = SPARSE_BACKEND_BATCH_SPECS[batch_name]
      use_fp8_ds_mla_quantization = kv_cache_dtype == "fp8_ds_mla"
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 140e071c7..96f0c39c5 100644
+index b067cdd00..74daeb32c 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -392,24 +392,22 @@ class MLAAttention(nn.Module, AttentionLayerBase):
@@ -1709,7 +1600,7 @@ index 3b354dd3e..424e9567f 100644
          if apply_router_weight_on_input:
              topk_weights = torch.ones_like(topk_weights)
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-index 8759fc8e6..23e7d9274 100644
+index 87c44d92f..8ede0b728 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 @@ -57,6 +57,40 @@ if has_triton_kernels():
@@ -1753,7 +1644,7 @@ index 8759fc8e6..23e7d9274 100644
  class Mxfp4MoeBackend(Enum):
      NONE = "None"
      # DeepGEMM FP8xFP4 backend (SM100+)
-@@ -709,15 +743,18 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+@@ -641,15 +675,18 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
      """Convert loaded weights into backend-specific kernel format."""
  
      if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
@@ -1776,7 +1667,7 @@ index 8759fc8e6..23e7d9274 100644
              w13_bias,
              w2_bias,
          )
-@@ -1252,17 +1289,18 @@ def convert_weight_to_mxfp4_moe_kernel_format(
+@@ -1184,17 +1221,18 @@ def convert_weight_to_mxfp4_moe_kernel_format(
      """
  
      if mxfp4_backend == Mxfp4MoeBackend.DEEPGEMM_MXFP4:
@@ -1899,13 +1790,13 @@ index 71442fb1a..8be0a951f 100644
  
      if original_ndim == 2:
 diff --git a/vllm/model_executor/warmup/deep_gemm_warmup.py b/vllm/model_executor/warmup/deep_gemm_warmup.py
-index 9b11d1df8..9b77cce15 100644
+index 78fa68a37..d41604fc7 100644
 --- a/vllm/model_executor/warmup/deep_gemm_warmup.py
 +++ b/vllm/model_executor/warmup/deep_gemm_warmup.py
-@@ -11,7 +11,9 @@ from tqdm import tqdm
- 
+@@ -12,7 +12,9 @@ from tqdm import tqdm
  import vllm.envs as envs
  from vllm.distributed.parallel_state import get_dp_group, is_global_first_rank
+ from vllm.model_executor.layers.fused_moe import MoERunner
 -from vllm.model_executor.layers.fused_moe.deep_gemm_utils import compute_aligned_M
 +from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
 +    compute_aligned_M_and_alignment,
@@ -1921,7 +1812,7 @@ index 9b11d1df8..9b77cce15 100644
  )
  from vllm.utils.math_utils import cdiv
  from vllm.utils.platform_utils import num_compute_units
-@@ -236,7 +239,7 @@ def _get_grouped_gemm_params(
+@@ -238,7 +241,7 @@ def _get_grouped_gemm_params(
      w2: torch.Tensor,
      num_topk: int,
      max_tokens: int,
@@ -1930,7 +1821,7 @@ index 9b11d1df8..9b77cce15 100644
      assert w1.size(0) == w2.size(0), "w1 and w2 must have the same number of experts"
  
      block_m = get_mk_alignment_for_contiguous_layout()[0]
-@@ -246,19 +249,46 @@ def _get_grouped_gemm_params(
+@@ -248,19 +251,46 @@ def _get_grouped_gemm_params(
      # Assumes all ranks have the same max_num_batched_tokens
      max_tokens = get_dp_group().world_size * max_tokens
  
@@ -1988,7 +1879,7 @@ index 9b11d1df8..9b77cce15 100644
  
  
  def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
-@@ -276,7 +306,11 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
+@@ -278,7 +308,11 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
      ):
          return
  
@@ -2001,7 +1892,7 @@ index 9b11d1df8..9b77cce15 100644
      device = w1.device
  
      def _warmup(w: torch.Tensor, w_scale: torch.Tensor):
-@@ -287,15 +321,14 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
+@@ -289,15 +323,14 @@ def _deepgemm_grouped_fp8_gemm_nt_contiguous_warmup(
          )
          out = torch.empty((MAX_M, n), device=device, dtype=torch.bfloat16)
  
@@ -2025,7 +1916,7 @@ index 9b11d1df8..9b77cce15 100644
              if pbar is not None:
                  pbar.update(1)
  
-@@ -348,8 +381,8 @@ def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
+@@ -350,8 +383,8 @@ def _count_warmup_iterations(model: torch.nn.Module, max_tokens: int) -> int:
              w13, _, w2, _, num_topk = _extract_data_from_fused_moe_module(m)
              if w13.size() in seen_grouped_sizes and w2.size() in seen_grouped_sizes:
                  continue
@@ -3163,10 +3054,10 @@ index 20be18e33..1efa987fe 100644
              compress_norm_rope_store_fn = compress_norm_rope_store_cutedsl
              extra_kwargs: dict[str, Any] = dict(
 diff --git a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-index d036943d4..6f22a7139 100644
+index d036943d4..170bd0ccc 100644
 --- a/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
 +++ b/vllm/models/deepseek_v4/nvidia/flashinfer_sparse.py
-@@ -1,22 +1,25 @@
+@@ -1,22 +1,26 @@
  # SPDX-License-Identifier: Apache-2.0
  # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 -"""DeepSeek V4 FlashInfer TRTLLM-gen sparse MLA backend.
@@ -3191,6 +3082,7 @@ index d036943d4..6f22a7139 100644
  import torch
  
 +from vllm.config import get_current_vllm_config
++from vllm.config.cache import CacheDType
  from vllm.forward_context import get_forward_context
  from vllm.models.deepseek_v4.attention import DeepseekV4Attention
  from vllm.models.deepseek_v4.common.ops import (
@@ -3199,11 +3091,12 @@ index d036943d4..6f22a7139 100644
  )
  from vllm.models.deepseek_v4.nvidia.ops.o_proj import (
      compute_fp8_einsum_recipe,
-@@ -27,15 +30,19 @@ from vllm.models.deepseek_v4.sparse_mla import (
+@@ -26,16 +30,20 @@ from vllm.models.deepseek_v4.sparse_mla import (
+     DeepseekV4FlashMLABackend,
      DeepseekV4FlashMLAMetadata,
  )
++from vllm.platforms.interface import DeviceCapability
  from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
-+from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 +from vllm.v1.worker.workspace import current_workspace_manager
  
  if TYPE_CHECKING:
@@ -3221,7 +3114,7 @@ index d036943d4..6f22a7139 100644
  
  def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
      workspace = _flashinfer_dsv4_workspace_by_device.get(device)
-@@ -49,6 +56,51 @@ def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
+@@ -49,6 +57,51 @@ def _get_flashinfer_dsv4_workspace(device: torch.device) -> torch.Tensor:
      return workspace
  
  
@@ -3273,34 +3166,80 @@ index d036943d4..6f22a7139 100644
  class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
      """Shares the FlashMLA V4 metadata/cache pipeline; swaps the attention impl.
  
-@@ -64,23 +116,11 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
+@@ -59,28 +112,57 @@ class DeepseekV4FlashInferMLASparseBackend(DeepseekV4FlashMLABackend):
+     shape for non-``fp8_ds_mla`` dtypes.
+     """
+ 
++    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = [
++        "auto",
++        "bfloat16",
++        "fp8",
++        "fp8_e4m3",
++        "fp8_ds_mla",
++    ]
++
+     @staticmethod
+     def get_name() -> str:
          return "FLASHINFER_MLA_SPARSE_DSV4"
  
- 
+-
 -class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
 -    """FlashInfer TRTLLM-gen sparse MLA attention layer for DeepSeek V4."""
-+class _DeepseekV4FlashInferMLAAttentionBase(DeepseekV4Attention):
-+    """Shared DeepSeek V4 FlashInfer sparse MLA attention helpers."""
- 
-     backend_cls = DeepseekV4FlashInferMLASparseBackend
+-
+-    backend_cls = DeepseekV4FlashInferMLASparseBackend
 -    # FlashInfer stores a plain bf16 / per-tensor fp8 KV row, not the FlashMLA
 -    # packed fp8_ds_mla block format (UE8M0 block-scaled fp8 as uint8).
 -    use_flashmla_fp8_layout: ClassVar[bool] = False
--
--    @classmethod
++    @classmethod
++    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
++        return capability.major in (10, 12)
+ 
+     @classmethod
 -    def get_padded_num_q_heads(cls, num_heads: int) -> int:
 -        # FP8 decode kernel only supports h_q = 64 or 128.
 -        if num_heads > 128:
 -            raise ValueError(
 -                f"DeepseekV4 Flashinfer MLA Sparse does not support {num_heads} heads "
 -                "(FP8 decode kernel requires h_q in {64, 128})."
--            )
++    def supports_combination(
++        cls,
++        head_size: int,
++        dtype: torch.dtype,
++        kv_cache_dtype: CacheDType | None,
++        block_size: int | None,
++        use_mla: bool,
++        has_sink: bool,
++        use_sparse: bool,
++        device_capability: DeviceCapability,
++    ) -> str | None:
++        if device_capability.major == 10 and kv_cache_dtype == "fp8_ds_mla":
++            return (
++                "FLASHINFER_MLA_SPARSE_DSV4 SM10 uses a plain KV row and "
++                "does not support fp8_ds_mla kv-cache dtype"
+             )
 -        return 64 if num_heads <= 64 else 128
++        if device_capability.major == 12:
++            if kv_cache_dtype not in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
++                return "kv_cache_dtype not supported"
++            from vllm.utils.flashinfer import has_flashinfer_sparse_mla_sm120
++
++            if not has_flashinfer_sparse_mla_sm120():
++                return (
++                    "FLASHINFER_MLA_SPARSE_DSV4 SM120 requires FlashInfer's "
++                    "sparse-sm120 MLA wrapper"
++                )
++        return None
++
++
++class _DeepseekV4FlashInferMLAAttentionBase(DeepseekV4Attention):
++    """Shared DeepSeek V4 FlashInfer sparse MLA attention helpers."""
++
++    backend_cls = DeepseekV4FlashInferMLASparseBackend
 +    use_fp8_ds_mla_layout: ClassVar[bool] = False
  
      def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
          return deep_gemm_fp8_o_proj(
-@@ -130,6 +170,21 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -130,6 +212,21 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          self._flashinfer_fp8_bmm1_scale = self.scale * fp8_q_scale * fp8_kv_scale
          self._flashinfer_fp8_bmm2_scale = fp8_kv_scale
  
@@ -3311,7 +3250,7 @@ index d036943d4..6f22a7139 100644
 +        self,
 +        q: torch.Tensor,
 +        output: torch.Tensor,
-+        flashmla_metadata: FlashMLASparseMetadata | None,
++        flashmla_metadata: DeepseekV4FlashMLAMetadata | None,
 +        swa_metadata: "DeepseekSparseSWAMetadata",
 +        self_kv_cache: torch.Tensor | None,
 +        swa_kv_cache: torch.Tensor,
@@ -3322,7 +3261,7 @@ index d036943d4..6f22a7139 100644
      def forward_mqa(
          self,
          q: torch.Tensor,
-@@ -137,9 +192,10 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -137,9 +234,10 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          positions: torch.Tensor,
          output: torch.Tensor,
      ) -> None:
@@ -3336,7 +3275,7 @@ index d036943d4..6f22a7139 100644
          assert output.shape[0] == q.shape[0] and output.shape[-1] == q.shape[-1], (
              f"output buffer shape {output.shape} incompatible with q shape {q.shape}"
          )
-@@ -158,8 +214,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -158,8 +256,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          forward_context = get_forward_context()
          attn_metadata = forward_context.attn_metadata
          if attn_metadata is None:
@@ -3346,7 +3285,7 @@ index d036943d4..6f22a7139 100644
              output.zero_()
              return
  
-@@ -178,17 +233,17 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -178,17 +275,17 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          self_kv_cache = self.kv_cache if not swa_only else None
          swa_kv_cache = self.swa_cache_layer.kv_cache
  
@@ -3370,7 +3309,7 @@ index d036943d4..6f22a7139 100644
          self,
          kv_cache: torch.Tensor | None,
          swa_k_cache: torch.Tensor,
-@@ -196,11 +251,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -196,11 +293,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          attn_metadata: DeepseekV4FlashMLAMetadata | None,
          swa_only: bool,
      ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -3382,7 +3321,7 @@ index d036943d4..6f22a7139 100644
          num_decodes = swa_metadata.num_decodes
          num_prefills = swa_metadata.num_prefills
          num_decode_tokens = swa_metadata.num_decode_tokens
-@@ -307,7 +357,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -307,7 +399,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          )
          return compressed_kv_cache, seq_lens, sparse_indices, sparse_topk_lens
  
@@ -3391,7 +3330,7 @@ index d036943d4..6f22a7139 100644
          self,
          q: torch.Tensor,
          kv_cache: torch.Tensor | None,
-@@ -332,7 +382,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -332,7 +424,7 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
              seq_lens,
              sparse_indices,
              sparse_topk_lens,
@@ -3400,7 +3339,7 @@ index d036943d4..6f22a7139 100644
              kv_cache=kv_cache,
              swa_k_cache=swa_k_cache,
              swa_metadata=swa_metadata,
-@@ -340,8 +390,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -340,8 +432,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
              swa_only=swa_only,
          )
  
@@ -3409,7 +3348,7 @@ index d036943d4..6f22a7139 100644
          query = q[:num_tokens]
          output = output[:num_tokens]
          bmm1_scale: float | torch.Tensor = self.scale
-@@ -354,9 +402,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -354,9 +444,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
              assert query.dtype == torch.bfloat16
              query = query.contiguous()
  
@@ -3419,7 +3358,7 @@ index d036943d4..6f22a7139 100644
          padded_heads = output.shape[1]
          if query.shape[1] < padded_heads:
              padded_query = query.new_zeros(
-@@ -370,9 +415,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -370,9 +457,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
          query_start_loc_cpu = swa_metadata.query_start_loc_cpu
          assert query_start_loc is not None and query_start_loc_cpu is not None
  
@@ -3429,7 +3368,7 @@ index d036943d4..6f22a7139 100644
          if num_decode_tokens > 0:
              decode_cu = query_start_loc[: num_decodes + 1]
              decode_cu_cpu = query_start_loc_cpu[: num_decodes + 1]
-@@ -394,8 +436,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -394,8 +478,6 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
              )
  
          if num_prefill_tokens > 0:
@@ -3438,7 +3377,7 @@ index d036943d4..6f22a7139 100644
              prefill_cu = (
                  query_start_loc[num_decodes : num_reqs + 1]
                  - query_start_loc[num_decodes]
-@@ -417,3 +457,367 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+@@ -417,3 +499,367 @@ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
                  cum_seq_lens_q=prefill_cu,
                  max_q_len=int(prefill_lens_cpu.max().item()),
              )
@@ -3487,7 +3426,7 @@ index d036943d4..6f22a7139 100644
 +        q: torch.Tensor,
 +        kv_cache: torch.Tensor | None,
 +        swa_metadata: "DeepseekSparseSWAMetadata",
-+        attn_metadata: FlashMLASparseMetadata | None,
++        attn_metadata: DeepseekV4FlashMLAMetadata | None,
 +        swa_only: bool,
 +        output: torch.Tensor,
 +    ) -> None:
@@ -3569,7 +3508,7 @@ index d036943d4..6f22a7139 100644
 +        compressed_k_cache: torch.Tensor | None,
 +        swa_k_cache: torch.Tensor,
 +        output: torch.Tensor,
-+        attn_metadata: FlashMLASparseMetadata | None,
++        attn_metadata: DeepseekV4FlashMLAMetadata | None,
 +        swa_metadata: "DeepseekSparseSWAMetadata",
 +    ) -> None:
 +        swa_only = self.compress_ratio <= 1
@@ -3714,7 +3653,7 @@ index d036943d4..6f22a7139 100644
 +        self,
 +        q: torch.Tensor,
 +        output: torch.Tensor,
-+        flashmla_metadata: FlashMLASparseMetadata | None,
++        flashmla_metadata: DeepseekV4FlashMLAMetadata | None,
 +        swa_metadata: "DeepseekSparseSWAMetadata",
 +        self_kv_cache: torch.Tensor | None,
 +        swa_kv_cache: torch.Tensor,
@@ -3781,7 +3720,7 @@ index d036943d4..6f22a7139 100644
 +        self,
 +        q: torch.Tensor,
 +        output: torch.Tensor,
-+        flashmla_metadata: FlashMLASparseMetadata | None,
++        flashmla_metadata: DeepseekV4FlashMLAMetadata | None,
 +        swa_metadata: "DeepseekSparseSWAMetadata",
 +        self_kv_cache: torch.Tensor | None,
 +        swa_kv_cache: torch.Tensor,
@@ -3807,10 +3746,10 @@ index d036943d4..6f22a7139 100644
 +                output=output[:num_decode_tokens],
 +            )
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index 00866e694..76d838a64 100644
+index 364754f9d..129777be3 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
-@@ -56,10 +56,12 @@ from vllm.model_executor.models.utils import (
+@@ -59,10 +59,12 @@ from vllm.model_executor.models.utils import (
  from vllm.model_executor.utils import set_weight_attrs
  from vllm.models.deepseek_v4.attention import DeepseekV4Attention
  from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
@@ -3824,7 +3763,7 @@ index 00866e694..76d838a64 100644
  from vllm.sequence import IntermediateTensors
  from vllm.v1.attention.backends.registry import AttentionBackendEnum
  
-@@ -716,14 +718,31 @@ class DeepseekV4MoE(nn.Module):
+@@ -726,14 +728,31 @@ class DeepseekV4MoE(nn.Module):
  def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
      """Pick the CUDA sparse-MLA attention class for the configured backend.
  
@@ -4253,7 +4192,7 @@ index 4252ce877..c9ecb0831 100644
 +    "get_k_grouped_mn_major_tma_aligned_packed_ue8m0_tensor",
  ]
 diff --git a/vllm/utils/flashinfer.py b/vllm/utils/flashinfer.py
-index 95f8b4b7e..7e11936dd 100644
+index e05182778..67cdc95a0 100644
 --- a/vllm/utils/flashinfer.py
 +++ b/vllm/utils/flashinfer.py
 @@ -209,6 +209,26 @@ def has_flashinfer_moe() -> bool:
@@ -4284,7 +4223,7 @@ index 95f8b4b7e..7e11936dd 100644
  def has_flashinfer_cutedsl() -> bool:
      """Return ``True`` if FlashInfer cutedsl module is available."""
 diff --git a/vllm/v1/attention/backend.py b/vllm/v1/attention/backend.py
-index 4b4a4435b..cb5ddab7c 100644
+index 152178ec2..271a21ef2 100644
 --- a/vllm/v1/attention/backend.py
 +++ b/vllm/v1/attention/backend.py
 @@ -150,6 +150,28 @@ class AttentionBackend(ABC):
@@ -4316,7 +4255,7 @@ index 4b4a4435b..cb5ddab7c 100644
      @classmethod
      def get_supported_head_sizes(cls) -> list[int]:
          return []
-@@ -402,7 +424,7 @@ class CommonAttentionMetadata:
+@@ -404,7 +426,7 @@ class CommonAttentionMetadata:
      positions: torch.Tensor | None = None
      """(num_actual_tokens,) token positions.  Optional; set when the caller
      has positions available so that builders can pre-compute position-dependent
@@ -4326,7 +4265,7 @@ index 4b4a4435b..cb5ddab7c 100644
      is_prefilling: torch.Tensor | None = None
      """(batch_size,) bool tensor: True if request is still in prefill phase
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
-index 842153f40..5f9a80278 100644
+index aa6301c13..3be5833da 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -1,23 +1,12 @@
@@ -4428,8 +4367,8 @@ index 842153f40..5f9a80278 100644
          return capability.major == 10
  
      @classmethod
-@@ -113,10 +108,15 @@ class FlashInferMLASparseBackend(AttentionBackend):
-         use_sparse: bool,
+@@ -114,10 +109,15 @@ class FlashInferMLASparseBackend(AttentionBackend):
+         use_mm_prefix: bool,
          device_capability: DeviceCapability,
      ) -> str | None:
 -        # FlashInfer MLA sparse kernel requires qk_nope_head_dim in [128, 192]
@@ -4445,7 +4384,7 @@ index 842153f40..5f9a80278 100644
          if vllm_config.model_config is not None:
              hf_text_config = vllm_config.model_config.hf_text_config
              qk_nope_head_dim = getattr(hf_text_config, "qk_nope_head_dim", 1)
-@@ -145,6 +145,239 @@ class FlashInferMLASparseBackend(AttentionBackend):
+@@ -146,6 +146,239 @@ class FlashInferMLASparseBackend(AttentionBackend):
          return "HND"
  
  
@@ -4685,7 +4624,7 @@ index 842153f40..5f9a80278 100644
  @dataclass
  class FlashInferMLASparseMetadata(AttentionMetadata):
      """Attention metadata for FlashInfer MLA Sparse backend."""
-@@ -348,6 +581,8 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
+@@ -349,6 +582,8 @@ class FlashInferMLASparseImpl(SparseMLAAttentionImpl[FlashInferMLASparseMetadata
              if is_quantized_kv_cache(self.kv_cache_dtype):
                  self.bmm2_scale *= layer._k_scale_float
  

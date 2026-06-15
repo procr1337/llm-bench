@@ -1,5 +1,11 @@
+commit 9baca374ed396d89b2931ff59aac45d570826fe2
+Author: Procr <193802945+procr1337@users.noreply.github.com>
+Date:   Mon Jun 8 09:31:20 2026 +0000
+
+    cutlass MoE patch by voipmonitor
+
 diff --git a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
-index ff259c828..5313a6e4f 100644
+index 76cd15ff5..261c715b5 100644
 --- a/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
 +++ b/vllm/model_executor/layers/fused_moe/experts/flashinfer_cutlass_moe.py
 @@ -103,20 +103,25 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
@@ -38,7 +44,7 @@ index ff259c828..5313a6e4f 100644
              if quant_config.quant_dtype == "mxfp8":
                  self.fake_input_scale = torch.ones(
                      self.num_experts,
-@@ -323,9 +328,6 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
+@@ -325,9 +330,6 @@ class FlashInferExperts(mk.FusedMoEExpertsModular):
          elif self.weight_quant_dtype == "mxfp4":
              assert self.w1_scale is not None and self.w2_scale is not None
              assert w1.is_contiguous() and w2.is_contiguous()
@@ -49,10 +55,10 @@ index ff259c828..5313a6e4f 100644
  
              fc1_expert_biases = self.w1_bias
 diff --git a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-index 23e7d9274..e1343ed43 100644
+index 8ede0b728..38a85b4b9 100644
 --- a/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
 +++ b/vllm/model_executor/layers/fused_moe/oracle/mxfp4.py
-@@ -1058,6 +1058,82 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
+@@ -990,6 +990,82 @@ def convert_gpt_oss_weight_to_mxfp4_moe_kernel_format(
              w2_bias,
          )
  
@@ -135,7 +141,7 @@ index 23e7d9274..e1343ed43 100644
      elif mxfp4_backend == Mxfp4MoeBackend.AITER_MXFP4_BF16:
          from vllm._aiter_ops import rocm_aiter_ops
  
-@@ -1563,10 +1639,85 @@ def convert_weight_to_mxfp4_moe_kernel_format(
+@@ -1495,10 +1571,85 @@ def convert_weight_to_mxfp4_moe_kernel_format(
              w13_bias,
              w2_bias,
          )

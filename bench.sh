@@ -60,3 +60,5 @@ OPTS=(
   --output /out/benchmark_results_estonia.json
 )
 docker run -ti --rm "${OPTS[@]}"
+
+docker logs "$name" >results/"$name"/vllm.log 2>&1
