@@ -145,6 +145,64 @@ voipmonitor2() {
   docker run --name "$NAME" -d "${OPTS[@]}"
 }
 
+voipmonitor3() {
+  NAME=voipmonitor3
+  IMAGE=voipmonitor/vllm:chthonic-consecration-2cdc3d9-b12x-d311dba-latest-cu132@sha256:a469b632c9556c61a8b3f11cc8ae1238f915cd12c82db54bd04577b11d4d4cd7
+
+  OPTS=(
+    "${DOCKER_COMMON[@]}"
+    -v /data/cache/$NAME:/cache
+    -v /data/hf:/root/.cache/huggingface:ro
+
+    -e CUDA_DEVICE_ORDER=PCI_BUS_ID
+    -e CUTE_DSL_ARCH=sm_120a
+    -e VLLM_USE_AOT_COMPILE=1
+    -e VLLM_USE_BREAKABLE_CUDAGRAPH=0
+    -e VLLM_USE_MEGA_AOT_ARTIFACT=1
+    -e VLLM_MEMORY_PROFILE_INCLUDE_ATTN=1
+    -e B12X_MHC_MAX_TOKENS=16384
+    -e VLLM_USE_FLASHINFER_SAMPLER=1
+    -e VLLM_USE_B12X_WO_PROJECTION=1
+    -e VLLM_USE_B12X_MHC=1
+    -e VLLM_USE_B12X_FP8_GEMM=1
+    -e VLLM_USE_B12X_MOE=1
+    -e VLLM_USE_B12X_SPARSE_INDEXER=1
+    -e VLLM_USE_V2_MODEL_RUNNER=1
+    -e VLLM_PCIE_ALLREDUCE_BACKEND=b12x
+    -e VLLM_ENABLE_PCIE_ALLREDUCE=1
+    -e VLLM_PREFIX_CACHE_RETENTION_INTERVAL=4096
+    -e B12X_MLA_SM120_UNIFIED=1
+    -e USES_B12X=True
+    -e B12X_DENSE_SPLITK_TURBO=1
+    -e B12X_W4A16_TC_DECODE=1
+    -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+    --entrypoint /bin/sh
+    "$IMAGE"
+    -c 'unset NCCL_GRAPH_FILE NCCL_GRAPH_DUMP_FILE VLLM_B12X_MLA_EXTEND_MAX_CHUNKS && exec vllm serve "$@"' --
+    "${VLLM_COMMON[@]}"
+
+    --gpu-memory-utilization 0.875
+
+    --load-format safetensors
+    --attention-backend B12X_MLA_SPARSE
+    --moe-backend b12x
+    --linear-backend b12x
+
+    --max-num-seqs 64
+    --max-num-batched-tokens 4096
+    #--max-num-batched-tokens 8192
+    --max-cudagraph-capture-size 192
+    --async-scheduling
+    --no-scheduler-reserve-full-isl
+    --enable-chunked-prefill
+    --speculative-config '{"method":"mtp","num_speculative_tokens":2,"draft_sample_method":"probabilistic","moe_backend":"b12x","use_local_argmax_reduction":true}'
+  )
+
+  docker rm -f "$NAME"
+  docker run --name "$NAME" -d "${OPTS[@]}"
+}
+
 lavd1() {
   NAME=lavd1
   IMAGE='lavd/vllm:b12x-abyssal-abjuration-6-5-13.2-2@sha256:d8a24af3e3010823399aa76d13fac7f197b265abe07f97d9e312e7d535ad7879'
@@ -359,12 +417,14 @@ lucifer3_cutlass() {
 docker stop -t1 \
   voipmonitor1 \
   voipmonitor2 \
+  voipmonitor3 \
   lavd1 \
   cstechdev1 \
   lucifer1 \
   lucifer1_cutlass \
   lucifer2 \
   lucifer2_cutlass \
+  lucifer3_cutlass \
   || true
 
 "$1"
