@@ -21,11 +21,10 @@ DOCKER_COMMON=(
   --ipc host
   --shm-size 8g
   --network llm --ip 172.23.0.10
-  --memory 60g
+  --memory 160g
   --ulimit memlock=-1 --ulimit stack=67108864
 
-  # Can't afford more DDR5...
-  -e MAX_JOBS=10
+  -e MAX_JOBS=32
   -e TRANSFORMERS_OFFLINE=1
   -e HF_OFFLINE=1
 
